@@ -11,6 +11,14 @@ except ImportError:
     # Fallback: if http_server is not available, create a minimal app
     create_app = None
 
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+try:
+    import pandas as pd
+    warnings.filterwarnings("ignore", category=pd.errors.Pandas4Warning)
+except ImportError:
+    pass
+
 from ..models import CropAction, CropObservation
 from .crop_environment import CropEnvironment
 

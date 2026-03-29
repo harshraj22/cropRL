@@ -270,8 +270,9 @@ def calculate_yield(
     elif crop_age < required_months:
         maturity_factor = (crop_age / required_months) ** 2
     else:
+        # Rotting: drops 50% per month past peak maturity
         months_over = crop_age - required_months
-        maturity_factor = max(0.0, 1.0 - 0.2 * months_over)
+        maturity_factor = max(0.0, 1.0 - 0.5 * months_over)
 
     deterministic_yield = base * nitrogen_factor * water_factor * maturity_factor
 
