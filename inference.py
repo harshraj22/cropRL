@@ -24,7 +24,7 @@ from openai import OpenAI
 from crop_env.config import EnvConfig
 from crop_env.models import CropAction
 from crop_env.server.crop_environment import CropEnvironment
-from crop_env.tasks import TASKS, create_env_for_task
+from crop_env.tasks import TASKS, create_env_for_task, grader
 
 # ── Configuration ──────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -62,28 +62,13 @@ KEY RULES:
 - Bankruptcy (negative cash + loan) ends the game with heavy penalty.
 - At month 60, remaining soil health and crop/storage value give terminal bonus.
 
-STRATEGY HINTS:
-- Rotate crops: Corn for profit, then Chickpea to restore soil.
-- Sell when prices are high (pre-monsoon Apr-May: 1.15x).
-- Store crops to sell later at better prices.
-- Irrigate during dry months (Summer) to protect yields.
-- Keep soil nitrogen above 0.4 for decent yields.
-
 Respond with ONLY a single integer (0-10). No explanation needed.
 """
 
 
-def strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks from model output (qwen3, etc)."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
 def parse_action(response_text: str) -> int:
-    """Extract an action integer from the LLM response.
-
-    Strips <think> blocks first so reasoning traces don't pollute parsing.
-    """
-    cleaned = strip_thinking(response_text).strip()
+    """Extract an action integer from the LLM response."""
+    cleaned = response_text.strip()
     # If it's just a bare number, use it directly
     if cleaned.isdigit():
         val = int(cleaned)
@@ -102,7 +87,6 @@ def run_episode(
     client: OpenAI,
     task_id: str,
     verbose: bool = False,
-    extra_body: dict | None = None,
 ) -> dict:
     """
     Run a single episode using the LLM agent.
@@ -115,9 +99,6 @@ def run_episode(
         Task to run ("easy", "medium", "hard").
     verbose : bool
         Print per-step details.
-    extra_body : dict, optional
-        Extra parameters passed to the chat completion API call.
-        Useful for model-specific options (e.g. {"think": True} for Ollama).
 
     Returns a dict with episode results.
     """
@@ -127,11 +108,6 @@ def run_episode(
     total_reward = 0.0
     trajectory = []
     step = 0
-
-    # Build API kwargs (only include extra_body if provided)
-    api_kwargs = {}
-    if extra_body:
-        api_kwargs["extra_body"] = extra_body
 
     while not obs.done and step < MAX_STEPS:
         # Build user message from text summary
@@ -146,7 +122,6 @@ def run_episode(
                 ],
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
-                **api_kwargs,
             )
             response = completion.choices[0].message.content or ""
             action_id = parse_action(response)
@@ -169,6 +144,11 @@ def run_episode(
             "cash": obs.cash_balance,
             "debt": obs.current_debt,
             "soil_n": obs.soil_nitrogen,
+            "prices": [
+                obs.market_price_crop_1,
+                obs.market_price_crop_2,
+                obs.market_price_crop_3,
+            ]
         })
 
         step += 1
@@ -177,9 +157,12 @@ def run_episode(
     final_net_worth = (
         obs.cash_balance - obs.current_debt + obs.soil_nitrogen * 10000
     )
+    
+    score = grader(task_id, final_net_worth, obs.done and step < MAX_STEPS, trajectory)
 
     return {
         "task_id": task_id,
+        "score": score,
         "steps_completed": step,
         "total_reward": total_reward,
         "final_cash": obs.cash_balance,
@@ -218,6 +201,7 @@ def main():
         status = "BANKRUPT" if r["bankrupt"] else "COMPLETED"
         print(
             f"  {tid:10s}: {status:10s} | "
+            f"Score: {r['score']:.2f} | "
             f"Steps: {r['steps_completed']:3d} | "
             f"Net Worth: ₹{r['final_net_worth']:,.0f} | "
             f"Total Reward: ₹{r['total_reward']:,.0f}"

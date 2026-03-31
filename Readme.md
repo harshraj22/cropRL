@@ -6,7 +6,7 @@ The goal is to **maximize net worth** (cash + asset value − debt) by the end o
 
 ---
 
-## The Domain
+## Motivation & Real-World Utility
 
 ### Why Agriculture?
 
