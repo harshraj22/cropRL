@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-llm-inference-env"
+version = "0.1.0"
+description = "LLM Inference Request Scheduling RL Environment for OpenEnv"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.2",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.24.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    "simpy>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+server = "llm_inference_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+    "llm_inference_env",
+    "llm_inference_env.server",
+    "llm_inference_env.simulation",
+    "llm_inference_env.tests",
+]
+package-dir = {
+    "llm_inference_env" = ".",
+    "llm_inference_env.server" = "server",
+    "llm_inference_env.simulation" = "simulation",
+    "llm_inference_env.tests" = "tests",
+}
