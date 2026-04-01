@@ -1,6 +1,6 @@
 """Tests for environment reset and initial state."""
 
-from crop_env.server.crop_environment import CropEnvironment
+from crop_env.server.environment import CropEnvironment
 
 
 class TestReset:
