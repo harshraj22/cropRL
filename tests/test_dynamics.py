@@ -3,8 +3,8 @@
 import pytest
 import numpy as np
 
-from crop_env.config import EnvConfig
-from crop_env.dynamics import (
+from cropRL.config import EnvConfig
+from cropRL.dynamics import (
     generate_rainfall,
     calculate_interest_rate,
     generate_market_prices,

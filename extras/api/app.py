@@ -23,10 +23,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from crop_env.config import EnvConfig
-from crop_env.models import CropAction
-from crop_env.server.environment import CropEnvironment
-from crop_env.tasks import TASKS, create_env_for_task
+from cropRL.config import EnvConfig
+from cropRL.models import CroprlAction
+from cropRL.server.cropRL_environment import CroprlEnvironment
+from cropRL.tasks import TASKS, create_env_for_task
 
 from .schemas import (
     ActionRequest,
@@ -44,12 +44,12 @@ app = FastAPI(
 )
 
 # ── Global environment instance ────────────────────────────────
-_env: CropEnvironment | None = None
+_env: CroprlEnvironment | None = None
 _last_obs = None
 _episode_step = 0
 
 
-def _get_env() -> CropEnvironment:
+def _get_env() -> CroprlEnvironment:
     if _env is None:
         raise HTTPException(
             status_code=400,
@@ -166,7 +166,7 @@ def take_action(req: ActionRequest):
             detail=f"Invalid action_id {req.action_id}. Must be 0-10.",
         )
 
-    action = CropAction(action_id=req.action_id)
+    action = CroprlAction(action_id=req.action_id)
     _last_obs = env.step(action)
     _episode_step += 1
 
@@ -206,7 +206,7 @@ def take_action(req: ActionRequest):
 
 
 def _obs_to_dict(obs) -> dict:
-    """Convert a CropObservation to a JSON-friendly dict."""
+    """Convert a CroprlObservation to a JSON-friendly dict."""
     return {
         "current_month": obs.current_month,
         "current_step": obs.current_step,

@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from crop_env.config import EnvConfig
-from crop_env.dynamics import calculate_yield, generate_market_prices
+from cropRL.config import EnvConfig
+from cropRL.dynamics import calculate_yield, generate_market_prices
 
 
 # ── Yield Noise ────────────────────────────────────────────────

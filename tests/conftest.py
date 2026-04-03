@@ -3,8 +3,8 @@
 import pytest
 import numpy as np
 
-from crop_env.config import EnvConfig
-from crop_env.server.environment import CropEnvironment
+from cropRL.config import EnvConfig
+from cropRL.server.cropRL_environment import CroprlEnvironment
 
 
 @pytest.fixture
@@ -16,7 +16,7 @@ def config():
 @pytest.fixture
 def env():
     """Fresh environment, reset with seed 42."""
-    e = CropEnvironment()
+    e = CroprlEnvironment()
     e.reset(seed=42)
     return e
 

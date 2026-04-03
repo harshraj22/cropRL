@@ -16,8 +16,8 @@ import numpy as np
 from openenv.core.env_server.types import Observation, State
 from openenv.core.env_server.interfaces import Environment
 
-from ..config import EnvConfig
-from ..dynamics import (
+from cropRL.config import EnvConfig
+from cropRL.dynamics import (
     apply_spoilage,
     calculate_expected_yield_potential,
     calculate_interest_rate,
@@ -26,10 +26,10 @@ from ..dynamics import (
     generate_market_prices,
     generate_rainfall,
 )
-from ..models import CropAction, CropObservation, CropState
+from cropRL.models import CroprlAction, CroprlObservation, CroprlState
 
 
-class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
+class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState]):
     """
     Farm management RL environment.
 
@@ -57,7 +57,7 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
         # Will be initialised in reset()
         self._rng: Optional[np.random.Generator] = None
         self._internal: dict[str, Any] = {}
-        self._state = CropState(task_id=task_id)
+        self._state = CroprlState(task_id=task_id)
 
     # ──────────────────────────────────────────────────────────────
     # OpenEnv interface: reset
@@ -68,7 +68,7 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
         **kwargs: Any,
-    ) -> CropObservation:
+    ) -> CroprlObservation:
         """
         Start a new episode.
 
@@ -129,7 +129,7 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
         )
 
         # Build state object
-        self._state = CropState(
+        self._state = CroprlState(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
             irrigated_this_month=False,
@@ -152,10 +152,10 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
 
     def step(
         self,
-        action: CropAction,
+        action: CroprlAction,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
-    ) -> CropObservation:
+    ) -> CroprlObservation:
         """
         Execute one monthly step.
 
@@ -448,7 +448,7 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
     # ──────────────────────────────────────────────────────────────
 
     @property
-    def state(self) -> CropState:
+    def state(self) -> CroprlState:
         """Return the current internal state."""
         return self._state
 
@@ -462,8 +462,8 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
         reward: float,
         done: bool,
         message: str,
-    ) -> CropObservation:
-        """Construct a CropObservation from current internal state."""
+    ) -> CroprlObservation:
+        """Construct a CroprlObservation from current internal state."""
         s = self._internal
         cfg = self.config
 
@@ -500,7 +500,7 @@ class CropEnvironment(Environment[CropAction, CropObservation, CropState]):
                 obs_dict, cfg, s["has_active_loan"], valid_actions
             )
 
-        return CropObservation(
+        return CroprlObservation(
             **obs_dict,
             text_summary=text_summary,
             done=done,

@@ -1,6 +1,6 @@
 import pytest
-from crop_env.config import EnvConfig
-from crop_env.dynamics import calculate_expected_yield_potential, calculate_yield
+from cropRL.config import EnvConfig
+from cropRL.dynamics import calculate_expected_yield_potential, calculate_yield
 
 def test_yield_decays_after_maturity(config):
     """Ensure that the yield potential decays mathematically after crossing growth_months."""

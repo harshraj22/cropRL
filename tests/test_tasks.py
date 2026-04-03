@@ -2,8 +2,8 @@
 
 import pytest
 
-from crop_env.config import EnvConfig
-from crop_env.tasks import create_env_for_task
+from cropRL.config import EnvConfig
+from cropRL.tasks import create_env_for_task
 
 
 class TestTasks:
