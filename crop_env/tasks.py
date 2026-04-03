@@ -8,7 +8,7 @@ but different environment complexity levels.
 from __future__ import annotations
 
 from .config import EnvConfig
-from .server.crop_environment import CropEnvironment
+from .server.environment import CropEnvironment
 
 
 TASKS: dict[str, dict] = {

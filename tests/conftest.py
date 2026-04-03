@@ -4,7 +4,7 @@ import pytest
 import numpy as np
 
 from crop_env.config import EnvConfig
-from crop_env.server.crop_environment import CropEnvironment
+from crop_env.server.environment import CropEnvironment
 
 
 @pytest.fixture

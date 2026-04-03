@@ -1,7 +1,7 @@
 """Tests for the OpenEnv State interface."""
 
 from crop_env.models import CropAction
-from crop_env.server.crop_environment import CropEnvironment
+from crop_env.server.environment import CropEnvironment
 
 
 class TestState:

@@ -8,6 +8,8 @@ Usage:
 try:
     from openenv.core.env_server.http_server import create_app
 except ImportError:
+    import traceback
+    traceback.print_exc()
     # Fallback: if http_server is not available, create a minimal app
     create_app = None
 
@@ -19,13 +21,28 @@ try:
 except ImportError:
     pass
 
+import sys
+import os
+
+if __package__ == "server" or __package__ is None:
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    __package__ = "crop_env.server"
+
 from ..models import CropAction, CropObservation
-from .crop_environment import CropEnvironment
+from .environment import CropEnvironment
 
 if create_app is not None:
     app = create_app(
         CropEnvironment, CropAction, CropObservation, env_name="crop_env"
     )
+
+    from fastapi.responses import RedirectResponse
+    @app.get("/", include_in_schema=False)
+    def root():
+        return RedirectResponse(url="/docs")
+
 else:
     # Minimal FastAPI fallback for local development without full OpenEnv
     from fastapi import FastAPI

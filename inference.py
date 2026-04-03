@@ -1,212 +1,152 @@
 """
-Inference Script for CropRL Environment.
-===================================
-MANDATORY:
-- Before submitting, ensure the following variables are defined in your environment:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
+Rule-Based Inference Script for CropRL Environment
+=================================================
 
-- The inference script must be named `inference.py` and placed in the root directory
-- Participants must use OpenAI Client for all LLM calls using above variables
+STDOUT FORMAT
+- The script must emit exactly three line types to stdout, in this order:
 
-Usage:
-    API_BASE_URL="https://..." MODEL_NAME="meta-llama/..." HF_TOKEN="..." python inference.py
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...,rn>
 """
 
-import json
 import os
-import re
-import sys
+from typing import List, Optional
 
-from openai import OpenAI
-
-from crop_env.config import EnvConfig
+from crop_env.tasks import create_env_for_task, grader
 from crop_env.models import CropAction
-from crop_env.server.crop_environment import CropEnvironment
-from crop_env.tasks import TASKS, create_env_for_task, grader
 
-# ── Configuration ──────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-MAX_STEPS = 60
-TEMPERATURE = 0.2
-MAX_TOKENS = 150
-FALLBACK_ACTION = 0  # Wait
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
-SYSTEM_PROMPT = """\
-You are an expert farm manager AI. You manage a small Indian farm over 60 months.
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
 
-OBJECTIVE: Maximize your net worth (cash + crop value - debt + soil bonus) by the end of 60 months.
-
-ACTIONS (reply with ONLY the action number):
-0: Wait — Do nothing this month.
-1: Plant Corn — High cost (₹800), high yield, depletes soil nitrogen heavily.
-2: Plant Wheat — Moderate cost (₹500), moderate yield, mild nitrogen drain.
-3: Plant Chickpea — Low cost (₹200), lower yield, RESTORES soil nitrogen.
-4: Irrigate — Costs ₹300, mitigates drought impact on growing crops.
-5: Fertilize — Costs ₹400, boosts soil nitrogen by 0.15.
-6: Harvest & Store — Harvest crop and store it (auto-sells old storage).
-7: Harvest & Sell — Harvest crop and sell immediately at market price.
-8: Sell Inventory — Sell stored crops at current market price.
-9: Take Loan — Get ₹5,000 (only if no active loan). Interest accumulates monthly.
-10: Repay Loan — Pay off full debt (must have enough cash).
-
-KEY RULES:
-- Can only plant on fallow (empty) land.
-- Can only harvest crops aged >= 1 month. Crops mature at 3-4 months for full yield.
-- Storage rots after 6 months. Only one slot.
-- One loan at a time. Must repay full amount.
-- Soil nitrogen is crucial: low N = poor yields. Chickpeas restore N, Corn destroys it.
-- Bankruptcy (negative cash + loan) ends the game with heavy penalty.
-- At month 60, remaining soil health and crop/storage value give terminal bonus.
-
-Respond with ONLY a single integer (0-10). No explanation needed.
-"""
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
-def parse_action(response_text: str) -> int:
-    """Extract an action integer from the LLM response."""
-    cleaned = response_text.strip()
-    # If it's just a bare number, use it directly
-    if cleaned.isdigit():
-        val = int(cleaned)
-        if 0 <= val <= 10:
-            return val
-    # Otherwise scan for first valid number 0-10
-    matches = re.findall(r"\b(\d{1,2})\b", cleaned)
-    for match in matches:
-        val = int(match)
-        if 0 <= val <= 10:
-            return val
-    return FALLBACK_ACTION
-
-
-def run_episode(
-    client: OpenAI,
-    task_id: str,
-    verbose: bool = False,
-) -> dict:
+def rule_based_agent(obs) -> int:
     """
-    Run a single episode using the LLM agent.
-
-    Parameters
-    ----------
-    client : OpenAI
-        OpenAI-compatible client.
-    task_id : str
-        Task to run ("easy", "medium", "hard").
-    verbose : bool
-        Print per-step details.
-
-    Returns a dict with episode results.
+    Deterministic rule-based agent for CropRL environment.
+    Action IDs:
+    0=Wait, 1=Corn, 2=Wheat, 3=Chickpea, 4=Irrigate, 5=Fertilize,
+    6=Harvest & Store, 7=Harvest & Sell, 8=Sell Inventory, 9=Take Loan, 10=Repay Loan
     """
-    env = create_env_for_task(task_id, text_mode=True)
+    # 1. Clear inventory first if any
+    if obs.stored_amount > 0:
+        return 8  # Sell Inventory
+        
+    # 2. Plant if land is fallow
+    if obs.active_crop_type == 0:
+        # If soil nitrogen is low, plant restorative crop (Chickpea)
+        if obs.soil_nitrogen < 0.4 and obs.cash_balance >= obs.cost_seed_3:
+            return 3
+        # If we have lots of cash and decent soil, plant high-yield (Corn)
+        elif obs.cash_balance >= obs.cost_seed_1 and obs.soil_nitrogen > 0.5:
+            return 1
+        # Otherwise plant moderate (Wheat)
+        elif obs.cash_balance >= obs.cost_seed_2:
+            return 2
+        # Failsafe if broke but no loan
+        elif obs.cash_balance < obs.cost_seed_3 and not getattr(obs, "has_active_loan", False):
+            # We don't have enough to plant the cheapest crop. Take a loan if we don't have one!
+            # Wait, has_active_loan might not be in Observation, it's in State. 
+            # We can guess by looking at debt.
+            if obs.current_debt == 0:
+                return 9 # Take Loan
+        return 0  # Wait
+        
+    # 3. Manage growing crop
+    if obs.active_crop_type > 0:
+        # If crop is mature enough
+        if obs.crop_age_months >= 4:
+            return 7  # Harvest & Sell
+        elif obs.crop_age_months >= 3 and obs.expected_yield_potential > 0.8:
+            return 7  # Harvest & Sell early if yield is good
+            
+        # Optional: Fertilize if soil is very low
+        if obs.soil_nitrogen < 0.2 and obs.cash_balance >= obs.cost_fertilize:
+            return 5
+            
+        # Optional: Irrigate if expected rainfall is very low
+        if obs.expected_rainfall < 0.3 and obs.cash_balance >= obs.cost_irrigate:
+            return 4
+            
+    return 0  # Wait
+
+
+def run_episode(task_id: str):
+    env = create_env_for_task(task_id, text_mode=False)
     obs = env.reset(seed=42)
-
-    total_reward = 0.0
-    trajectory = []
-    step = 0
-
-    while not obs.done and step < MAX_STEPS:
-        # Build user message from text summary
-        user_msg = obs.text_summary if obs.text_summary else obs.message
-
-        try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            response = completion.choices[0].message.content or ""
-            action_id = parse_action(response)
-        except Exception as e:
-            print(f"  LLM error at step {step}: {e}", file=sys.stderr)
-            action_id = FALLBACK_ACTION
-            response = f"ERROR: {e}"
-
-        if verbose:
-            print(f"  Step {step}: Action={action_id} ({env.config.action_names[action_id]})")
-
-        action = CropAction(action_id=action_id)
-        obs = env.step(action)
-        total_reward += obs.reward or 0.0
-
-        trajectory.append({
-            "step": step,
-            "action_id": action_id,
-            "reward": obs.reward,
-            "cash": obs.cash_balance,
-            "debt": obs.current_debt,
-            "soil_n": obs.soil_nitrogen,
-            "prices": [
-                obs.market_price_crop_1,
-                obs.market_price_crop_2,
-                obs.market_price_crop_3,
-            ]
-        })
-
-        step += 1
-
-    # Final state
-    final_net_worth = (
-        obs.cash_balance - obs.current_debt + obs.soil_nitrogen * 10000
-    )
     
-    score = grader(task_id, final_net_worth, obs.done and step < MAX_STEPS, trajectory)
-
-    return {
-        "task_id": task_id,
-        "score": score,
-        "steps_completed": step,
-        "total_reward": total_reward,
-        "final_cash": obs.cash_balance,
-        "final_debt": obs.current_debt,
-        "final_soil_n": obs.soil_nitrogen,
-        "final_net_worth": final_net_worth,
-        "bankrupt": obs.done and step < MAX_STEPS,
-    }
-
-
-def main():
-    """Run inference on all tasks and print results."""
-    print("=" * 60)
-    print("CropRL Inference — OpenAI Client")
-    print(f"API: {API_BASE_URL}")
-    print(f"Model: {MODEL_NAME}")
-    print("=" * 60)
-
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=API_KEY,
-    )
-
-    results = {}
-    for task_id in TASKS:
-        print(f"\n--- Task: {task_id} ---")
-        print(f"Description: {TASKS[task_id]['description']}")
-        result = run_episode(client, task_id, verbose=True)
-        results[task_id] = result
-        print(f"  Result: {json.dumps(result, indent=2)}")
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for tid, r in results.items():
-        status = "BANKRUPT" if r["bankrupt"] else "COMPLETED"
-        print(
-            f"  {tid:10s}: {status:10s} | "
-            f"Score: {r['score']:.2f} | "
-            f"Steps: {r['steps_completed']:3d} | "
-            f"Net Worth: ₹{r['final_net_worth']:,.0f} | "
-            f"Total Reward: ₹{r['total_reward']:,.0f}"
+    history: List[str] = []
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    
+    log_start(task=task_id, env="croprl", model="rule-based")
+    
+    trajectory = []
+    
+    try:
+        for step in range(1, env.config.max_steps + 1):
+            if obs.done:
+                break
+                
+            action_id = rule_based_agent(obs)
+            action_name = env.config.action_names[action_id]
+            
+            action = CropAction(action_id=action_id)
+            obs = env.step(action)
+            
+            reward = obs.reward or 0.0
+            done = obs.done
+            
+            rewards.append(reward)
+            steps_taken = step
+            
+            log_step(step=step, action=action_name, reward=reward, done=done, error=None)
+            
+            trajectory.append({
+                "step": step,
+                "action_id": action_id,
+                "reward": reward,
+                "cash": obs.cash_balance,
+                "debt": obs.current_debt,
+                "soil_n": obs.soil_nitrogen,
+                "prices": [
+                    obs.market_price_crop_1,
+                    obs.market_price_crop_2,
+                    obs.market_price_crop_3,
+                ]
+            })
+            
+            if done:
+                break
+                
+        # Calculate score using the grader
+        final_net_worth = (
+            obs.cash_balance - obs.current_debt + obs.soil_nitrogen * 10000
         )
+        score = grader(task_id, final_net_worth, obs.done and steps_taken < env.config.max_steps, trajectory)
+        
+        # Consider successful if score >= 0.1
+        success = score >= 0.1
+        
+    except Exception as e:
+        print(f"[DEBUG] Error during episode execution: {e}", flush=True)
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":
-    main()
+    for task in ["easy", "medium", "hard"]:
+        run_episode(task)
