@@ -1,28 +1,23 @@
-"""
-CropRL WebSocket Client.
-
-Translates between typed CropRL models and the WebSocket wire format.
-Users import this to interact with a running CropRL server.
-"""
+"""Croprl Environment Client."""
 
 from openenv.core.env_client import EnvClient
 from openenv.core.client_types import StepResult
 
-from .models import CropAction, CropObservation, CropState
+from .models import CroprlAction, CroprlObservation, CroprlState
 
 
-class CropEnv(EnvClient[CropAction, CropObservation, CropState]):
-    """Typed client for the CropRL environment."""
+class CroprlEnv(EnvClient[CroprlAction, CroprlObservation, CroprlState]):
+    """Typed client for the Croprl environment."""
 
-    def _step_payload(self, action: CropAction) -> dict:
-        """Serialize a CropAction to the wire format."""
+    def _step_payload(self, action: CroprlAction) -> dict:
+        """Serialize a CroprlAction to the wire format."""
         return {"action_id": action.action_id}
 
     def _parse_result(self, payload: dict) -> StepResult:
         """Deserialize a step response into a StepResult."""
         obs_data = payload.get("observation", {})
         return StepResult(
-            observation=CropObservation(
+            observation=CroprlObservation(
                 done=payload.get("done", False),
                 reward=payload.get("reward", 0.0),
                 current_month=obs_data.get("current_month", 1),
@@ -53,9 +48,9 @@ class CropEnv(EnvClient[CropAction, CropObservation, CropState]):
             done=payload.get("done", False),
         )
 
-    def _parse_state(self, payload: dict) -> CropState:
-        """Deserialize a state response into a CropState."""
-        return CropState(
+    def _parse_state(self, payload: dict) -> CroprlState:
+        """Deserialize a state response into a CroprlState."""
+        return CroprlState(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),
             irrigated_this_month=payload.get("irrigated_this_month", False),

@@ -1,6 +1,6 @@
 """Tests for environment reset and initial state."""
 
-from crop_env.server.environment import CropEnvironment
+from cropRL.server.cropRL_environment import CroprlEnvironment
 
 
 class TestReset:
@@ -23,20 +23,20 @@ class TestReset:
         assert obs.soil_nitrogen == 0.6
 
     def test_reproducibility_with_seed(self):
-        e1 = CropEnvironment()
+        e1 = CroprlEnvironment()
         obs1 = e1.reset(seed=123)
 
-        e2 = CropEnvironment()
+        e2 = CroprlEnvironment()
         obs2 = e2.reset(seed=123)
 
         assert obs1.expected_rainfall == obs2.expected_rainfall
         assert obs1.market_price_crop_1 == obs2.market_price_crop_1
 
     def test_different_seeds_different_values(self):
-        e1 = CropEnvironment()
+        e1 = CroprlEnvironment()
         obs1 = e1.reset(seed=1)
 
-        e2 = CropEnvironment()
+        e2 = CroprlEnvironment()
         obs2 = e2.reset(seed=999)
 
         assert (

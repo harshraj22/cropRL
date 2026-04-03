@@ -25,9 +25,9 @@ import re
 from openai import OpenAI
 from tqdm import tqdm
 
-from crop_env.config import EnvConfig
-from crop_env.models import CropAction
-from crop_env.tasks import TASKS, create_env_for_task
+from cropRL.config import EnvConfig
+from cropRL.models import CroprlAction
+from cropRL.tasks import TASKS, create_env_for_task
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -164,7 +164,7 @@ def run_episode_interactive(
             response = ""
 
         # Execute action
-        action = CropAction(action_id=action_id)
+        action = CroprlAction(action_id=action_id)
         obs = env.step(action)
         reward = obs.reward or 0.0
         total_reward += reward

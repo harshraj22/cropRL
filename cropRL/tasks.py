@@ -8,7 +8,7 @@ but different environment complexity levels.
 from __future__ import annotations
 
 from .config import EnvConfig
-from .server.environment import CropEnvironment
+from .server.cropRL_environment import CroprlEnvironment
 
 
 TASKS: dict[str, dict] = {
@@ -53,9 +53,9 @@ TASKS: dict[str, dict] = {
 
 def create_env_for_task(
     task_id: str, text_mode: bool = False
-) -> CropEnvironment:
+) -> CroprlEnvironment:
     """
-    Create a CropEnvironment configured for the given task.
+    Create a CroprlEnvironment configured for the given task.
 
     Parameters
     ----------
@@ -66,7 +66,7 @@ def create_env_for_task(
 
     Returns
     -------
-    CropEnvironment
+    CroprlEnvironment
         Environment with task-specific configuration.
 
     Raises
@@ -82,7 +82,7 @@ def create_env_for_task(
     overrides = TASKS[task_id]["config_overrides"].copy()
     overrides["text_mode"] = text_mode
     config = EnvConfig(**overrides)
-    return CropEnvironment(config=config, task_id=task_id)
+    return CroprlEnvironment(config=config, task_id=task_id)
 
 
 def list_tasks() -> dict[str, str]:
