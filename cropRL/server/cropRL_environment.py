@@ -2,8 +2,12 @@
 CropRL Core Environment.
 
 Implements the OpenEnv Environment interface for the farm management
-simulation. Orchestrates the monthly step loop by delegating physics
-to the dynamics engine.
+simulation. Orchestrates the step loop by delegating physics to the
+dynamics engine.
+
+Key design change (v2): Only the ``Wait`` action advances the calendar
+month.  All other actions execute instantly within the current month.
+The step counter increments on every action.
 """
 
 from __future__ import annotations
@@ -25,7 +29,9 @@ from cropRL.dynamics import (
     format_text_observation,
     generate_market_prices,
     generate_rainfall,
+    realise_rainfall,
 )
+from cropRL.enums import ActionType, CropType
 from cropRL.models import CroprlAction, CroprlObservation, CroprlState
 
 
@@ -33,16 +39,12 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
     """
     Farm management RL environment.
 
-    The agent manages a small Indian farm over ``config.max_steps`` monthly
-    steps.  Each step the agent picks one of 11 discrete actions (plant,
-    irrigate, fertilize, harvest, sell, loan management, or wait).
-
-    The environment tracks:
-    - Crop lifecycle (planting → growth → harvest)
-    - Soil nitrogen depletion / recovery
-    - Stochastic weather and market prices
-    - Financial state (cash, debt, interest)
-    - Single-slot crop storage with spoilage
+    The agent manages a small Indian farm.  Each step the agent picks one
+    of 11 discrete actions.  Only the ``Wait`` action advances the calendar
+    month and triggers monthly dynamics (rainfall realisation, crop ageing,
+    nitrogen drain, interest accrual, spoilage, fixed costs, and new
+    weather/price generation).  All other actions execute instantly within
+    the current month.
     """
 
     def __init__(
@@ -54,7 +56,6 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         self.config = config or EnvConfig()
         self.task_id = task_id
 
-        # Will be initialised in reset()
         self._rng: Optional[np.random.Generator] = None
         self._internal: dict[str, Any] = {}
         self._state = CroprlState(task_id=task_id)
@@ -69,17 +70,10 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         episode_id: Optional[str] = None,
         **kwargs: Any,
     ) -> CroprlObservation:
-        """
-        Start a new episode.
-
-        Initialises all farm state to starting conditions, generates
-        initial weather and market prices, and returns the first
-        observation.
-        """
+        """Start a new episode."""
         self._rng = np.random.default_rng(seed)
         cfg = self.config
 
-        # Calendar
         month = 1  # January
         step = 0
 
@@ -87,7 +81,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         rainfall = generate_rainfall(month, cfg, self._rng)
         prices = generate_market_prices(month, cfg, self._rng)
 
-        # Interest rate (use crop optimal 0.0 since no crop planted)
+        # Interest rate (no crop planted → optimal_water = 0.0)
         interest_rate = calculate_interest_rate(
             cfg.base_interest_rate, month, rainfall, 0.0
         )
@@ -96,35 +90,51 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         self._internal = {
             "month": month,
             "step": step,
-            "rainfall": rainfall,
+            "month_count": 0,
+            "year": 1,
+            "expected_rainfall": rainfall,
             "prices": prices,
             "interest_rate": interest_rate,
             # Crop
-            "active_crop_type": 0,
+            "active_crop_type": CropType.FALLOW,
             "crop_age_months": 0,
+            "planting_month": 0,  # month when current crop was planted
             # Soil
             "soil_nitrogen": cfg.initial_soil_nitrogen,
+            # Water
+            "water_level": 0.0,
             # Finance
             "cash": cfg.initial_cash,
             "debt": 0.0,
             "has_active_loan": False,
+            "loan_interest_rate": 0.0,
             # Storage
-            "stored_crop_type": 0,
+            "stored_crop_type": CropType.FALLOW,
             "stored_amount": 0.0,
             "stored_age_months": 0,
             # Per-step flags
             "irrigated": False,
             "fertilized": False,
-            # Reward
-            "previous_cash": cfg.initial_cash,
+            # Inflated values (mutated by inflation each year)
+            "inflated_seed_costs": list(cfg.seed_costs),
+            "inflated_cost_irrigate": cfg.cost_irrigate,
+            "inflated_cost_fertilize": cfg.cost_fertilize,
+            "inflated_loan_chunk": cfg.loan_chunk,
+            "inflated_base_land_price": cfg.base_land_price,
+            "inflated_monthly_fixed_cost": cfg.monthly_fixed_cost,
+            "inflated_base_market_prices": list(cfg.base_market_prices),
         }
+
+        # Compute initial net worth for reward tracking
+        self._internal["prev_net_worth"] = self._compute_net_worth()
 
         # Compute derived fields
         yield_potential = calculate_expected_yield_potential(
-            crop_type=0,
+            crop_type=CropType.FALLOW,
             crop_age=0,
             soil_nitrogen=cfg.initial_soil_nitrogen,
-            expected_rainfall=rainfall,
+            current_water_level=0.0,
+            current_month=month,
             config=cfg,
         )
 
@@ -136,6 +146,9 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             fertilized_this_month=False,
             previous_cash=cfg.initial_cash,
             has_active_loan=False,
+            loan_interest_rate=0.0,
+            current_month_count=0,
+            current_year=1,
             task_id=self.task_id,
         )
 
@@ -157,13 +170,15 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         **kwargs: Any,
     ) -> CroprlObservation:
         """
-        Execute one monthly step.
+        Execute one step.
 
-        1. Validate & execute the chosen action
-        2. Advance monthly dynamics (weather, prices, interest, ageing)
-        3. Check termination (bankruptcy / horizon)
-        4. Calculate reward
-        5. Return observation
+        1. Record previous net worth
+        2. Execute the chosen action (instant effects)
+        3. Increment step counter
+        4. If action == Wait: advance monthly dynamics
+        5. Check termination
+        6. Calculate reward as Δ(net_worth) + penalties
+        7. Return observation
         """
         cfg = self.config
         s = self._internal
@@ -175,266 +190,95 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s["irrigated"] = False
         s["fertilized"] = False
 
-        if action_id == 0:
-            # Wait
+        if action_id == ActionType.WAIT:
             messages.append("You waited this month.")
+            # Month advance happens in step 4 below
 
-        elif action_id in (1, 2, 3):
-            # Plant crop
-            crop_idx = action_id
-            if s["active_crop_type"] != 0:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    f"INVALID: Cannot plant — land already has "
-                    f"{cfg.crop_names[s['active_crop_type']]} growing."
-                )
-            elif s["cash"] < cfg.seed_costs[crop_idx]:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    f"INVALID: Not enough cash to plant "
-                    f"{cfg.crop_names[crop_idx]} "
-                    f"(need ₹{cfg.seed_costs[crop_idx]:,.0f}, "
-                    f"have ₹{s['cash']:,.0f})."
-                )
-            else:
-                s["cash"] -= cfg.seed_costs[crop_idx]
-                s["active_crop_type"] = crop_idx
-                s["crop_age_months"] = 0
-                messages.append(
-                    f"Planted {cfg.crop_names[crop_idx]}. "
-                    f"Cost: ₹{cfg.seed_costs[crop_idx]:,.0f}."
-                )
+        elif action_id in (ActionType.PLANT_CORN, ActionType.PLANT_WHEAT, ActionType.PLANT_CHICKPEA):
+            penalty, msg = self._do_plant(s, action_id)
+            messages.append(msg)
 
-        elif action_id == 4:
-            # Irrigate
-            if s["active_crop_type"] == 0:
-                penalty += cfg.invalid_action_penalty
-                messages.append("INVALID: Nothing to irrigate — land is fallow.")
-            elif s["cash"] < cfg.cost_irrigate:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    f"INVALID: Not enough cash to irrigate "
-                    f"(need ₹{cfg.cost_irrigate:,.0f})."
-                )
-            else:
-                s["cash"] -= cfg.cost_irrigate
-                s["irrigated"] = True
-                messages.append(f"Irrigated. Cost: ₹{cfg.cost_irrigate:,.0f}.")
+        elif action_id == ActionType.IRRIGATE:
+            penalty, msg = self._do_irrigate(s)
+            messages.append(msg)
 
-        elif action_id == 5:
-            # Fertilize (always valid if cash available)
-            if s["cash"] < cfg.cost_fertilize:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    f"INVALID: Not enough cash to fertilize "
-                    f"(need ₹{cfg.cost_fertilize:,.0f})."
-                )
-            else:
-                s["cash"] -= cfg.cost_fertilize
-                s["soil_nitrogen"] = min(
-                    1.0, s["soil_nitrogen"] + cfg.fertilize_nitrogen_boost
-                )
-                s["fertilized"] = True
-                messages.append(
-                    f"Fertilized. Soil nitrogen boosted to "
-                    f"{s['soil_nitrogen']:.2f}. "
-                    f"Cost: ₹{cfg.cost_fertilize:,.0f}."
-                )
+        elif action_id == ActionType.FERTILIZE:
+            penalty, msg = self._do_fertilize(s)
+            messages.append(msg)
 
-        elif action_id == 6:
-            # Harvest & Store
+        elif action_id == ActionType.HARVEST_STORE:
             penalty, msg = self._do_harvest_store(s, cfg)
             messages.append(msg)
 
-        elif action_id == 7:
-            # Harvest & Sell
+        elif action_id == ActionType.HARVEST_SELL:
             penalty, msg = self._do_harvest_sell(s, cfg)
             messages.append(msg)
 
-        elif action_id == 8:
-            # Sell Inventory
-            if s["stored_amount"] <= 0:
-                penalty += cfg.invalid_action_penalty
-                messages.append("INVALID: Storage is empty — nothing to sell.")
-            else:
-                crop_t = s["stored_crop_type"]
-                price = s["prices"][crop_t - 1]  # prices is 0-indexed for crops 1,2,3
-                revenue = s["stored_amount"] * price
-                s["cash"] += revenue
-                messages.append(
-                    f"Sold {s['stored_amount']:.1f} tons of "
-                    f"{cfg.crop_names[crop_t]} at ₹{price:,.0f}/ton. "
-                    f"Revenue: ₹{revenue:,.0f}."
-                )
-                s["stored_crop_type"] = 0
-                s["stored_amount"] = 0.0
-                s["stored_age_months"] = 0
+        elif action_id == ActionType.SELL_INVENTORY:
+            penalty, msg = self._do_sell_inventory(s)
+            messages.append(msg)
 
-        elif action_id == 9:
-            # Take Loan
-            if s["has_active_loan"]:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    "INVALID: You already have an active loan. "
-                    "Repay it first before taking another."
-                )
-            else:
-                s["cash"] += cfg.loan_chunk
-                s["debt"] += cfg.loan_chunk
-                s["has_active_loan"] = True
-                messages.append(
-                    f"Took a loan of ₹{cfg.loan_chunk:,.0f}. "
-                    f"Total debt: ₹{s['debt']:,.0f}."
-                )
+        elif action_id == ActionType.TAKE_LOAN:
+            penalty, msg = self._do_take_loan(s)
+            messages.append(msg)
 
-        elif action_id == 10:
-            # Repay Loan
-            if not s["has_active_loan"]:
-                penalty += cfg.invalid_action_penalty
-                messages.append("INVALID: No active loan to repay.")
-            elif s["cash"] < s["debt"]:
-                penalty += cfg.invalid_action_penalty
-                messages.append(
-                    f"INVALID: Not enough cash to repay full debt. "
-                    f"Need ₹{s['debt']:,.0f}, have ₹{s['cash']:,.0f}."
-                )
-            else:
-                repay_amount = s["debt"]
-                s["cash"] -= repay_amount
-                s["debt"] = 0.0
-                s["has_active_loan"] = False
-                messages.append(
-                    f"Repaid full loan of ₹{repay_amount:,.0f}. "
-                    f"You are now debt-free."
-                )
+        elif action_id == ActionType.REPAY_LOAN:
+            penalty, msg = self._do_repay_loan(s)
+            messages.append(msg)
 
-        # ── 2. Advance monthly dynamics ────────────────────────────
-
-        # Advance step/month
+        # ── 2. Increment step counter ──────────────────────────────
         s["step"] += 1
-        s["month"] = (s["month"] % 12) + 1  # 1→2→…→12→1
 
-        # Age crop
-        if s["active_crop_type"] > 0:
-            s["crop_age_months"] += 1
+        # ── 3. If Wait: advance monthly dynamics ──────────────────
+        if action_id == ActionType.WAIT:
+            month_messages = self._advance_month(s, cfg)
+            messages.extend(month_messages)
 
-        # Age storage & check spoilage
-        if s["stored_amount"] > 0:
-            s["stored_age_months"] += 1
-            remaining, spoiled = apply_spoilage(
-                s["stored_age_months"], s["stored_amount"], cfg.max_storage_age
-            )
-            if spoiled:
-                messages.append(
-                    f"SPOILAGE: Your stored {cfg.crop_names[s['stored_crop_type']]} "
-                    f"({s['stored_amount']:.1f} tons) has rotted!"
-                )
-                s["stored_amount"] = 0.0
-                s["stored_crop_type"] = 0
-                s["stored_age_months"] = 0
-            else:
-                s["stored_amount"] = remaining
-
-        # Natural soil recovery
-        s["soil_nitrogen"] = min(
-            1.0, s["soil_nitrogen"] + cfg.natural_nitrogen_recovery
-        )
-
-        # Apply interest on debt
-        if s["has_active_loan"] and s["debt"] > 0:
-            monthly_rate = s["interest_rate"] / 12.0
-            s["debt"] *= 1.0 + monthly_rate
-
-        # [Future] Storage cost
-        if cfg.enable_storage_cost and s["stored_amount"] > 0:
-            storage_cost = cfg.cost_storage_monthly * s["stored_amount"]
-            s["cash"] -= storage_cost
-
-        # Generate new weather & prices for the new month
-        s["rainfall"] = generate_rainfall(s["month"], cfg, self._rng)
-        prev_prices = s["prices"]  # save for autocorrelation
-        s["prices"] = generate_market_prices(
-            s["month"], cfg, self._rng, prev_prices=prev_prices,
-        )
-
-        # Update interest rate
-        optimal = (
-            cfg.optimal_rainfall[s["active_crop_type"]]
-            if s["active_crop_type"] > 0
-            else 0.0
-        )
-        s["interest_rate"] = calculate_interest_rate(
-            cfg.base_interest_rate, s["month"], s["rainfall"], optimal
-        )
-
-        # Apply nitrogen impact from crop growth (passive depletion while growing)
-        # Note: main nitrogen_impact is applied at harvest time
-
-        # ── 3. Check termination ───────────────────────────────────
+        # ── 4. Check termination ───────────────────────────────────
         done = False
         terminal_bonus = 0.0
 
-        if s["step"] >= cfg.max_steps:
-            # Terminal liquidation
+        if s["step"] >= cfg.max_steps or s["month_count"] >= cfg.max_months:
             done = True
-            soil_bonus = s["soil_nitrogen"] * cfg.terminal_soil_bonus_factor
-
-            # Value of active crop (estimated)
-            active_value = 0.0
-            if s["active_crop_type"] > 0:
-                est_yield = calculate_yield(
-                    s["active_crop_type"],
-                    s["crop_age_months"],
-                    s["soil_nitrogen"],
-                    s["rainfall"],
-                    s["irrigated"],
-                    cfg,
-                )
-                price_idx = s["active_crop_type"] - 1
-                active_value = est_yield * s["prices"][price_idx]
-
-            # Value of stored crop
-            stored_value = 0.0
-            if s["stored_amount"] > 0:
-                stored_price_idx = s["stored_crop_type"] - 1
-                stored_value = s["stored_amount"] * s["prices"][stored_price_idx]
-
-            terminal_bonus = soil_bonus + active_value + stored_value
+            terminal_bonus = self._compute_terminal_value(s, cfg)
             messages.append(
-                f"EPISODE COMPLETE! Terminal bonus: ₹{terminal_bonus:,.0f} "
-                f"(soil: ₹{soil_bonus:,.0f}, "
-                f"crop: ₹{active_value:,.0f}, "
-                f"storage: ₹{stored_value:,.0f})."
+                f"EPISODE COMPLETE! Terminal profit: ₹{terminal_bonus:,.0f}."
             )
-
         elif s["cash"] < 0 and s["has_active_loan"]:
-            # Bankruptcy
             done = True
             penalty += cfg.bankruptcy_penalty
             messages.append(
                 "BANKRUPTCY! Cash is negative and you have outstanding debt."
             )
 
-        # ── 4. Calculate reward ────────────────────────────────────
-        cash_delta = s["cash"] - s["previous_cash"]
-        reward = cash_delta + penalty + terminal_bonus
-        s["previous_cash"] = s["cash"]
+        # ── 5. Calculate reward ────────────────────────────────────
+        current_net_worth = self._compute_net_worth()
+        if done and terminal_bonus != 0:
+            # On terminal step, reward includes the profit calculation
+            reward = terminal_bonus + penalty
+        else:
+            reward = (current_net_worth - s["prev_net_worth"]) + penalty
+        s["prev_net_worth"] = current_net_worth
 
-        # ── 5. Compute derived observation fields ──────────────────
+        # ── 6. Compute derived observation fields ──────────────────
         yield_potential = calculate_expected_yield_potential(
             s["active_crop_type"],
             s["crop_age_months"],
             s["soil_nitrogen"],
-            s["rainfall"],
+            s["water_level"],
+            s["planting_month"] or s["month"],
             cfg,
         )
 
-        # Update state
+        # Update state object
         self._state.step_count = s["step"]
         self._state.irrigated_this_month = s["irrigated"]
         self._state.fertilized_this_month = s["fertilized"]
-        self._state.previous_cash = s["previous_cash"]
+        self._state.previous_cash = s["cash"]
         self._state.has_active_loan = s["has_active_loan"]
+        self._state.loan_interest_rate = s["loan_interest_rate"]
+        self._state.current_month_count = s["month_count"]
+        self._state.current_year = s["year"]
 
         return self._build_observation(
             yield_potential=yield_potential,
@@ -453,119 +297,104 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         return self._state
 
     # ──────────────────────────────────────────────────────────────
-    # Private helpers
+    # Action handlers
     # ──────────────────────────────────────────────────────────────
 
-    def _build_observation(
-        self,
-        yield_potential: float,
-        reward: float,
-        done: bool,
-        message: str,
-    ) -> CroprlObservation:
-        """Construct a CroprlObservation from current internal state."""
-        s = self._internal
+    def _do_plant(self, s: dict, action_id: int) -> tuple[float, str]:
+        """Execute a plant action. Returns (penalty, message)."""
         cfg = self.config
+        crop_idx = action_id  # action 1→crop 1, 2→2, 3→3
+        seed_cost = s["inflated_seed_costs"][crop_idx]
 
-        obs_dict = {
-            "current_month": s["month"],
-            "current_step": s["step"],
-            "expected_rainfall": s["rainfall"],
-            "active_crop_type": s["active_crop_type"],
-            "crop_age_months": s["crop_age_months"],
-            "expected_yield_potential": yield_potential,
-            "soil_nitrogen": s["soil_nitrogen"],
-            "cash_balance": s["cash"],
-            "current_debt": s["debt"],
-            "current_interest_rate": s["interest_rate"],
-            "market_price_crop_1": s["prices"][0],
-            "market_price_crop_2": s["prices"][1],
-            "market_price_crop_3": s["prices"][2],
-            "cost_seed_1": cfg.seed_costs[1],
-            "cost_seed_2": cfg.seed_costs[2],
-            "cost_seed_3": cfg.seed_costs[3],
-            "cost_irrigate": cfg.cost_irrigate,
-            "cost_fertilize": cfg.cost_fertilize,
-            "stored_crop_type": s["stored_crop_type"],
-            "stored_amount": s["stored_amount"],
-            "stored_age_months": s["stored_age_months"],
-            "message": message,
-        }
-
-        # Text mode
-        text_summary = ""
-        if cfg.text_mode:
-            valid_actions = self._get_valid_actions()
-            text_summary = format_text_observation(
-                obs_dict, cfg, s["has_active_loan"], valid_actions
+        if s["active_crop_type"] != CropType.FALLOW:
+            return cfg.invalid_action_penalty, (
+                f"INVALID: Cannot plant — land already has "
+                f"{cfg.crop_names[s['active_crop_type']]} growing."
+            )
+        if s["cash"] < seed_cost:
+            return cfg.invalid_action_penalty, (
+                f"INVALID: Not enough cash to plant "
+                f"{cfg.crop_names[crop_idx]} "
+                f"(need ₹{seed_cost:,.0f}, have ₹{s['cash']:,.0f})."
             )
 
-        return CroprlObservation(
-            **obs_dict,
-            text_summary=text_summary,
-            done=done,
-            reward=reward,
+        s["cash"] -= seed_cost
+        s["active_crop_type"] = crop_idx
+        s["crop_age_months"] = 0
+        s["planting_month"] = s["month"]  # lock season at planting time
+        return 0.0, (
+            f"Planted {cfg.crop_names[crop_idx]}. Cost: ₹{seed_cost:,.0f}."
         )
 
-    def _get_valid_actions(self) -> list[int]:
-        """Return the list of currently valid action IDs."""
-        s = self._internal
+    def _do_irrigate(self, s: dict) -> tuple[float, str]:
+        """Execute irrigate action. Returns (penalty, message)."""
         cfg = self.config
-        valid = [0]  # Wait is always valid
+        irrigate_cost = s["inflated_cost_irrigate"]
 
-        # Plant actions (1, 2, 3)
-        if s["active_crop_type"] == 0:
-            for crop_idx in (1, 2, 3):
-                if s["cash"] >= cfg.seed_costs[crop_idx]:
-                    valid.append(crop_idx)
+        if s["active_crop_type"] == CropType.FALLOW:
+            return cfg.invalid_action_penalty, (
+                "INVALID: Nothing to irrigate — land is fallow."
+            )
+        if s["cash"] < irrigate_cost:
+            return cfg.invalid_action_penalty, (
+                f"INVALID: Not enough cash to irrigate "
+                f"(need ₹{irrigate_cost:,.0f})."
+            )
 
-        # Irrigate (4)
-        if s["active_crop_type"] > 0 and s["cash"] >= cfg.cost_irrigate:
-            valid.append(4)
+        s["cash"] -= irrigate_cost
+        s["irrigated"] = True
 
-        # Fertilize (5)
-        if s["cash"] >= cfg.cost_fertilize:
-            valid.append(5)
+        # Instant water level increase
+        crop_t = s["active_crop_type"]
+        s["water_level"] += cfg.irrigate_amount[crop_t]
+        optimal = cfg.optimal_water_level[crop_t]
+        s["water_level"] = min(s["water_level"], optimal)
 
-        # Harvest & Store (6), Harvest & Sell (7)
-        if s["active_crop_type"] > 0 and s["crop_age_months"] >= 1:
-            valid.append(6)
-            valid.append(7)
+        return 0.0, (
+            f"Irrigated. Water level now {s['water_level']:.2f}. "
+            f"Cost: ₹{irrigate_cost:,.0f}."
+        )
 
-        # Sell Inventory (8)
-        if s["stored_amount"] > 0:
-            valid.append(8)
+    def _do_fertilize(self, s: dict) -> tuple[float, str]:
+        """Execute fertilize action. Returns (penalty, message)."""
+        cfg = self.config
+        fert_cost = s["inflated_cost_fertilize"]
 
-        # Take Loan (9)
-        if not s["has_active_loan"]:
-            valid.append(9)
+        if s["cash"] < fert_cost:
+            return cfg.invalid_action_penalty, (
+                f"INVALID: Not enough cash to fertilize "
+                f"(need ₹{fert_cost:,.0f})."
+            )
 
-        # Repay Loan (10)
-        if s["has_active_loan"] and s["cash"] >= s["debt"]:
-            valid.append(10)
-
-        return sorted(valid)
+        s["cash"] -= fert_cost
+        s["soil_nitrogen"] = min(
+            1.0, s["soil_nitrogen"] + cfg.fertilize_nitrogen_boost
+        )
+        s["fertilized"] = True
+        return 0.0, (
+            f"Fertilized. Soil nitrogen boosted to "
+            f"{s['soil_nitrogen']:.2f}. Cost: ₹{fert_cost:,.0f}."
+        )
 
     def _do_harvest_store(
         self, s: dict, cfg: EnvConfig
     ) -> tuple[float, str]:
         """Execute Harvest & Store action. Returns (penalty, message)."""
-        if s["active_crop_type"] == 0 or s["crop_age_months"] < 1:
+        if s["active_crop_type"] == CropType.FALLOW or s["crop_age_months"] < 1:
             return cfg.invalid_action_penalty, (
                 "INVALID: Nothing to harvest — "
                 "no crop planted or crop too young."
             )
 
-        # Calculate yield
         crop_type = s["active_crop_type"]
         harvested = calculate_yield(
             crop_type,
             s["crop_age_months"],
             s["soil_nitrogen"],
-            s["rainfall"],
-            s["irrigated"],
+            s["water_level"],
+            s["planting_month"],
             cfg,
-            rng=self._rng,  # stochastic harvest
+            rng=self._rng,
         )
 
         parts: list[str] = []
@@ -581,19 +410,15 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
                 f"{cfg.crop_names[old_type]} for ₹{old_revenue:,.0f}."
             )
 
-        # Apply nitrogen impact from harvesting this crop
-        s["soil_nitrogen"] = max(
-            0.0, min(1.0, s["soil_nitrogen"] + cfg.nitrogen_impact[crop_type])
-        )
-
         # Store new harvest
         s["stored_crop_type"] = crop_type
         s["stored_amount"] = harvested
         s["stored_age_months"] = 0
 
         # Reset land
-        s["active_crop_type"] = 0
+        s["active_crop_type"] = CropType.FALLOW
         s["crop_age_months"] = 0
+        s["planting_month"] = 0
 
         parts.append(
             f"Harvested {harvested:.1f} tons of {cfg.crop_names[crop_type]} "
@@ -605,7 +430,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         self, s: dict, cfg: EnvConfig
     ) -> tuple[float, str]:
         """Execute Harvest & Sell action. Returns (penalty, message)."""
-        if s["active_crop_type"] == 0 or s["crop_age_months"] < 1:
+        if s["active_crop_type"] == CropType.FALLOW or s["crop_age_months"] < 1:
             return cfg.invalid_action_penalty, (
                 "INVALID: Nothing to harvest — "
                 "no crop planted or crop too young."
@@ -616,28 +441,367 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             crop_type,
             s["crop_age_months"],
             s["soil_nitrogen"],
-            s["rainfall"],
-            s["irrigated"],
+            s["water_level"],
+            s["planting_month"],
             cfg,
-            rng=self._rng,  # stochastic harvest
+            rng=self._rng,
         )
 
         price = s["prices"][crop_type - 1]
         revenue = harvested * price
-
-        # Apply nitrogen impact
-        s["soil_nitrogen"] = max(
-            0.0, min(1.0, s["soil_nitrogen"] + cfg.nitrogen_impact[crop_type])
-        )
-
-        # Cash in
         s["cash"] += revenue
 
         # Reset land
-        s["active_crop_type"] = 0
+        s["active_crop_type"] = CropType.FALLOW
         s["crop_age_months"] = 0
+        s["planting_month"] = 0
 
         return 0.0, (
             f"Harvested {harvested:.1f} tons of {cfg.crop_names[crop_type]} "
             f"and sold at ₹{price:,.0f}/ton. Revenue: ₹{revenue:,.0f}."
         )
+
+    def _do_sell_inventory(self, s: dict) -> tuple[float, str]:
+        """Execute Sell Inventory action. Returns (penalty, message)."""
+        cfg = self.config
+        if s["stored_amount"] <= 0:
+            return cfg.invalid_action_penalty, (
+                "INVALID: Storage is empty — nothing to sell."
+            )
+
+        crop_t = s["stored_crop_type"]
+        price = s["prices"][crop_t - 1]
+        revenue = s["stored_amount"] * price
+        s["cash"] += revenue
+        msg = (
+            f"Sold {s['stored_amount']:.1f} tons of "
+            f"{cfg.crop_names[crop_t]} at ₹{price:,.0f}/ton. "
+            f"Revenue: ₹{revenue:,.0f}."
+        )
+        s["stored_crop_type"] = CropType.FALLOW
+        s["stored_amount"] = 0.0
+        s["stored_age_months"] = 0
+        return 0.0, msg
+
+    def _do_take_loan(self, s: dict) -> tuple[float, str]:
+        """Execute Take Loan action. Returns (penalty, message)."""
+        cfg = self.config
+        if s["has_active_loan"]:
+            return cfg.invalid_action_penalty, (
+                "INVALID: You already have an active loan. "
+                "Repay it first before taking another."
+            )
+
+        loan_amount = s["inflated_loan_chunk"]
+        s["cash"] += loan_amount
+        s["debt"] += loan_amount
+        s["has_active_loan"] = True
+        # Lock the interest rate at loan origination
+        s["loan_interest_rate"] = s["interest_rate"]
+        return 0.0, (
+            f"Took a loan of ₹{loan_amount:,.0f} at "
+            f"{s['loan_interest_rate'] * 100:.1f}% annual. "
+            f"Total debt: ₹{s['debt']:,.0f}."
+        )
+
+    def _do_repay_loan(self, s: dict) -> tuple[float, str]:
+        """Execute Repay Loan action. Returns (penalty, message)."""
+        cfg = self.config
+        if not s["has_active_loan"]:
+            return cfg.invalid_action_penalty, (
+                "INVALID: No active loan to repay."
+            )
+        if s["cash"] < s["debt"]:
+            return cfg.invalid_action_penalty, (
+                f"INVALID: Not enough cash to repay full debt. "
+                f"Need ₹{s['debt']:,.0f}, have ₹{s['cash']:,.0f}."
+            )
+
+        repay_amount = s["debt"]
+        s["cash"] -= repay_amount
+        s["debt"] = 0.0
+        s["has_active_loan"] = False
+        s["loan_interest_rate"] = 0.0
+        return 0.0, (
+            f"Repaid full loan of ₹{repay_amount:,.0f}. "
+            f"You are now debt-free."
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # Monthly dynamics (called only from Wait action)
+    # ──────────────────────────────────────────────────────────────
+
+    def _advance_month(self, s: dict, cfg: EnvConfig) -> list[str]:
+        """
+        Advance all monthly dynamics.  Called once per ``Wait`` action.
+
+        Order of operations:
+        1. Increment month & month_count
+        2. Check & apply inflation (on year boundary)
+        3. Realise rainfall
+        4. Update water level (rain + consumption)
+        5. Age crop & apply monthly nitrogen impact
+        6. Natural nitrogen recovery
+        7. Age storage & check spoilage
+        8. Accrue interest on debt (locked rate)
+        9. Deduct monthly fixed cost
+        10. Generate new expected rainfall & market prices
+        11. Update interest rate
+        """
+        messages: list[str] = []
+
+        # 1. Increment month
+        old_month = s["month"]
+        s["month"] = (s["month"] % 12) + 1
+        s["month_count"] += 1
+
+        # 2. Inflation check (when month wraps to January)
+        if s["month"] == 1 and old_month == 12:
+            self._apply_inflation(s, cfg)
+            s["year"] += 1
+            messages.append(
+                f"Year {s['year']} begins. "
+                f"Inflation applied ({cfg.inflation_rate * 100:.0f}%)."
+            )
+
+        # 3. Realise rainfall
+        realised = realise_rainfall(
+            s["expected_rainfall"],
+            cfg.weather_sigma_realisation,
+            self._rng,
+        )
+
+        # 4. Update water level
+        crop_t = s["active_crop_type"]
+        s["water_level"] += realised
+        if crop_t != CropType.FALLOW:
+            s["water_level"] -= cfg.water_utilised_monthly[crop_t]
+        s["water_level"] = max(0.0, s["water_level"])
+        optimal = cfg.optimal_water_level[crop_t]
+        s["water_level"] = min(s["water_level"], optimal)
+
+        # 5. Age crop & monthly nitrogen impact
+        if crop_t != CropType.FALLOW:
+            s["crop_age_months"] += 1
+            s["soil_nitrogen"] += cfg.monthly_nitrogen_impact[crop_t]
+            s["soil_nitrogen"] = max(0.0, min(1.0, s["soil_nitrogen"]))
+
+        # 6. Natural nitrogen recovery
+        s["soil_nitrogen"] = min(
+            1.0, s["soil_nitrogen"] + cfg.natural_nitrogen_recovery
+        )
+
+        # 7. Age storage & check spoilage
+        if s["stored_amount"] > 0:
+            s["stored_age_months"] += 1
+            remaining, spoiled = apply_spoilage(
+                s["stored_age_months"], s["stored_amount"], cfg.max_storage_age
+            )
+            if spoiled:
+                messages.append(
+                    f"SPOILAGE: Your stored {cfg.crop_names[s['stored_crop_type']]} "
+                    f"({s['stored_amount']:.1f} tons) has rotted!"
+                )
+                s["stored_amount"] = 0.0
+                s["stored_crop_type"] = CropType.FALLOW
+                s["stored_age_months"] = 0
+            else:
+                s["stored_amount"] = remaining
+
+        # 8. Accrue interest (using locked rate from loan origination)
+        if s["has_active_loan"] and s["debt"] > 0:
+            monthly_rate = s["loan_interest_rate"] / 12.0
+            s["debt"] *= 1.0 + monthly_rate
+
+        # 9. Monthly fixed cost
+        s["cash"] -= s["inflated_monthly_fixed_cost"]
+
+        # [Future] Storage cost
+        if cfg.enable_storage_cost and s["stored_amount"] > 0:
+            storage_cost = cfg.cost_storage_monthly * s["stored_amount"]
+            s["cash"] -= storage_cost
+
+        # 10. Generate new expected rainfall & market prices
+        s["expected_rainfall"] = generate_rainfall(s["month"], cfg, self._rng)
+        prev_prices = s["prices"]
+        s["prices"] = generate_market_prices(
+            s["month"], cfg, self._rng,
+            prev_prices=prev_prices,
+            effective_base_prices=tuple(s["inflated_base_market_prices"]),
+        )
+
+        # 11. Update interest rate
+        optimal_water = (
+            cfg.optimal_water_level[s["active_crop_type"]]
+            if s["active_crop_type"] != CropType.FALLOW
+            else 0.0
+        )
+        s["interest_rate"] = calculate_interest_rate(
+            cfg.base_interest_rate, s["month"],
+            s["expected_rainfall"], optimal_water,
+        )
+
+        return messages
+
+    def _apply_inflation(self, s: dict, cfg: EnvConfig) -> None:
+        """Apply compounding inflation to all inflatable values."""
+        factor = 1.0 + cfg.inflation_rate
+        s["inflated_seed_costs"] = [c * factor for c in s["inflated_seed_costs"]]
+        s["inflated_cost_irrigate"] *= factor
+        s["inflated_cost_fertilize"] *= factor
+        s["inflated_loan_chunk"] *= factor
+        s["inflated_base_land_price"] *= factor
+        s["inflated_monthly_fixed_cost"] *= factor
+        s["inflated_base_market_prices"] = [
+            p * factor for p in s["inflated_base_market_prices"]
+        ]
+
+    # ──────────────────────────────────────────────────────────────
+    # Net worth & terminal value
+    # ──────────────────────────────────────────────────────────────
+
+    def _compute_net_worth(self) -> float:
+        """
+        Compute the agent's current net worth.
+
+        net_worth = cash + land_value + stored_value + growing_crop_value − debt
+
+        Used for the Δ(net_worth) reward signal (telescoping sum
+        decomposition that is mathematically equivalent to the sparse
+        final_value − initial_value objective).
+        """
+        s = self._internal
+        cfg = self.config
+
+        land_value = s["inflated_base_land_price"] * s["soil_nitrogen"]
+
+        stored_value = 0.0
+        if s["stored_amount"] > 0 and s["stored_crop_type"] != CropType.FALLOW:
+            stored_value = s["stored_amount"] * s["prices"][s["stored_crop_type"] - 1]
+
+        growing_value = 0.0
+        if s["active_crop_type"] != CropType.FALLOW:
+            est_yield = calculate_yield(
+                s["active_crop_type"],
+                s["crop_age_months"],
+                s["soil_nitrogen"],
+                s["water_level"],
+                s["planting_month"] or s["month"],
+                cfg,
+                rng=None,  # deterministic estimate
+            )
+            growing_value = est_yield * s["prices"][s["active_crop_type"] - 1]
+
+        return s["cash"] + land_value + stored_value + growing_value - s["debt"]
+
+    def _compute_terminal_value(self, s: dict, cfg: EnvConfig) -> float:
+        """
+        Compute the terminal profit: final_value − initial_value.
+
+        final_value  = cash + land_value + stored_value + unharvested_value − debt
+        initial_value = initial_cash + (base_land_price × initial_soil_nitrogen)
+        """
+        final_value = self._compute_net_worth()
+        initial_value = cfg.initial_cash + (cfg.base_land_price * cfg.initial_soil_nitrogen)
+        return final_value - initial_value
+
+    # ──────────────────────────────────────────────────────────────
+    # Observation builder
+    # ──────────────────────────────────────────────────────────────
+
+    def _build_observation(
+        self,
+        yield_potential: float,
+        reward: float,
+        done: bool,
+        message: str,
+    ) -> CroprlObservation:
+        """Construct a CroprlObservation from current internal state."""
+        s = self._internal
+        cfg = self.config
+
+        land_price = s["inflated_base_land_price"] * s["soil_nitrogen"]
+
+        obs_dict = {
+            "current_month": s["month"],
+            "current_step": s["step"],
+            "expected_rainfall": s["expected_rainfall"],
+            "active_crop_type": s["active_crop_type"],
+            "crop_age_months": s["crop_age_months"],
+            "expected_yield_potential": yield_potential,
+            "soil_nitrogen": s["soil_nitrogen"],
+            "current_water_level": s["water_level"],
+            "cash_balance": s["cash"],
+            "current_debt": s["debt"],
+            "current_interest_rate": s["interest_rate"],
+            "current_land_price": land_price,
+            "market_price_crop_1": s["prices"][0],
+            "market_price_crop_2": s["prices"][1],
+            "market_price_crop_3": s["prices"][2],
+            "cost_seed_1": s["inflated_seed_costs"][1],
+            "cost_seed_2": s["inflated_seed_costs"][2],
+            "cost_seed_3": s["inflated_seed_costs"][3],
+            "cost_irrigate": s["inflated_cost_irrigate"],
+            "cost_fertilize": s["inflated_cost_fertilize"],
+            "stored_crop_type": s["stored_crop_type"],
+            "stored_amount": s["stored_amount"],
+            "stored_age_months": s["stored_age_months"],
+            "message": message,
+        }
+
+        # Text mode
+        text_summary = ""
+        if cfg.text_mode:
+            valid_actions = self._get_valid_actions()
+            # Build a copy with extra display-only fields for the text formatter
+            text_dict = {**obs_dict, "monthly_fixed_cost": s["inflated_monthly_fixed_cost"]}
+            text_summary = format_text_observation(
+                text_dict, cfg, s["has_active_loan"], valid_actions
+            )
+
+        return CroprlObservation(
+            **obs_dict,
+            text_summary=text_summary,
+            done=done,
+            reward=reward,
+        )
+
+    def _get_valid_actions(self) -> list[int]:
+        """Return the list of currently valid action IDs."""
+        s = self._internal
+        cfg = self.config
+        valid = [ActionType.WAIT]  # Wait is always valid
+
+        # Plant actions (1, 2, 3)
+        if s["active_crop_type"] == CropType.FALLOW:
+            for crop_idx in (CropType.CORN, CropType.WHEAT, CropType.CHICKPEA):
+                if s["cash"] >= s["inflated_seed_costs"][crop_idx]:
+                    valid.append(crop_idx)
+
+        # Irrigate (4)
+        if (s["active_crop_type"] != CropType.FALLOW
+                and s["cash"] >= s["inflated_cost_irrigate"]):
+            valid.append(ActionType.IRRIGATE)
+
+        # Fertilize (5)
+        if s["cash"] >= s["inflated_cost_fertilize"]:
+            valid.append(ActionType.FERTILIZE)
+
+        # Harvest & Store (6), Harvest & Sell (7)
+        if s["active_crop_type"] != CropType.FALLOW and s["crop_age_months"] >= 1:
+            valid.append(ActionType.HARVEST_STORE)
+            valid.append(ActionType.HARVEST_SELL)
+
+        # Sell Inventory (8)
+        if s["stored_amount"] > 0:
+            valid.append(ActionType.SELL_INVENTORY)
+
+        # Take Loan (9)
+        if not s["has_active_loan"]:
+            valid.append(ActionType.TAKE_LOAN)
+
+        # Repay Loan (10)
+        if s["has_active_loan"] and s["cash"] >= s["debt"]:
+            valid.append(ActionType.REPAY_LOAN)
+
+        return sorted(valid)

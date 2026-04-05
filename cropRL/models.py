@@ -1,14 +1,15 @@
 """
-Data models for the Croprl Environment.
+Data models for the CropRL Environment.
 """
 
 from typing import Any, Dict, List, Optional
 from pydantic import Field
 from openenv.core.env_server.types import Action, Observation, State
 
+
 class CroprlAction(Action):
     """
-    Agent selects a discrete action each month.
+    Agent selects a discrete action each step.
     """
     action_id: int = Field(
         ge=0,
@@ -33,23 +34,25 @@ class CroprlAction(Action):
 
 class CroprlObservation(Observation):
     """
-    Full farm dashboard the agent sees each month.
+    Full farm dashboard the agent sees each step.
     """
     # ── Time & Weather ──────────────────────────────────────────
     current_month: int = Field(description="Calendar month 1-12")
     current_step: int = Field(description="Step index 0..max_steps-1")
-    expected_rainfall: float = Field(description="Generated rainfall for this month, 0.0 to 1.0")
+    expected_rainfall: float = Field(description="Forecasted rainfall for this month, 0.0 to 1.0")
 
     # ── Biological & Soil ───────────────────────────────────────
     active_crop_type: int = Field(description="0=Fallow, 1=Corn, 2=Wheat, 3=Chickpea")
     crop_age_months: int = Field(description="Months since planting")
     expected_yield_potential: float = Field(description="Estimated yield if harvested now, normalized 0.0-1.0")
     soil_nitrogen: float = Field(description="Soil nitrogen level 0.0-1.0")
+    current_water_level: float = Field(description="Current water level in the field 0.0-1.0")
 
     # ── Financial ───────────────────────────────────────────────
     cash_balance: float = Field(description="Current cash on hand")
     current_debt: float = Field(description="Outstanding loan debt")
     current_interest_rate: float = Field(description="Current annual interest rate")
+    current_land_price: float = Field(description="Current land value = base_land_price × soil_nitrogen")
     market_price_crop_1: float = Field(description="Spot price for Corn")
     market_price_crop_2: float = Field(description="Spot price for Wheat")
     market_price_crop_3: float = Field(description="Spot price for Chickpea")
@@ -79,4 +82,7 @@ class CroprlState(State):
     fertilized_this_month: bool = False
     previous_cash: float = 0.0
     has_active_loan: bool = False
+    loan_interest_rate: float = 0.0    # locked rate at loan origination
+    current_month_count: int = 0       # total months elapsed
+    current_year: int = 1              # for inflation tracking
     task_id: str = "default"

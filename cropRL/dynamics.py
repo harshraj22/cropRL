@@ -8,11 +8,13 @@ making them independently unit-testable.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
 
 from .config import EnvConfig
+from .enums import MONTH_NAMES, Season, get_season
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -22,8 +24,9 @@ from .config import EnvConfig
 
 def _get_seasonal_baseline(month: int, config: EnvConfig) -> float:
     """Return the seasonal rainfall baseline μ(m) for the given month."""
-    for months_tuple, baseline in config.weather_seasonal_baselines:
-        if month in months_tuple:
+    season = get_season(month)
+    for cfg_season, baseline in config.weather_seasonal_baselines:
+        if cfg_season == season:
             return baseline
     # Fallback (should not happen with well-configured baselines)
     return 0.5
@@ -33,27 +36,35 @@ def generate_rainfall(
     month: int, config: EnvConfig, rng: np.random.Generator
 ) -> float:
     """
-    Generate seasonal rainfall with Gaussian noise.
+    Generate expected (forecasted) seasonal rainfall with Gaussian noise.
 
-    W_t = clip(μ(m) + ε, 0, 1)  where ε ~ N(0, σ²)
+    W_expected = clip(μ(m) + ε, 0, 1)  where ε ~ N(0, weather_sigma²)
 
-    Parameters
-    ----------
-    month : int
-        Calendar month 1-12.
-    config : EnvConfig
-        Environment configuration (provides sigma and seasonal baselines).
-    rng : np.random.Generator
-        Seeded random generator for reproducibility.
-
-    Returns
-    -------
-    float
-        Rainfall value in [0.0, 1.0].
+    This is the forecast shown to the agent. The actual realised rainfall
+    is sampled separately via ``realise_rainfall()`` when the month ticks.
     """
     baseline = _get_seasonal_baseline(month, config)
     noise = rng.normal(0.0, config.weather_sigma)
+    noise = float(np.clip(noise, -3 * config.weather_sigma,
+                          3 * config.weather_sigma))
     return float(np.clip(baseline + noise, 0.0, 1.0))
+
+
+def realise_rainfall(
+    expected: float,
+    sigma: float,
+    rng: np.random.Generator,
+) -> float:
+    """
+    Sample actual rainfall close to the expected forecast.
+
+    W_actual = clip(W_expected + ε, 0, 1)  where ε ~ N(0, σ_realisation²)
+
+    Called once per month when the ``wait`` action triggers a month advance.
+    """
+    noise = rng.normal(0.0, sigma)
+    noise = float(np.clip(noise, -3 * sigma, 3 * sigma))
+    return float(np.clip(expected + noise, 0.0, 1.0))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -65,12 +76,12 @@ def calculate_interest_rate(
     base_rate: float,
     month: int,
     rainfall: float,
-    optimal_rainfall: float,
+    optimal_water_level: float,
 ) -> float:
     """
     Calculate the current annual interest rate.
 
-    R_interest = R_base + Δ_liquidity(m) + Δ_risk(W_deficit)
+    R = R_base + Δ_liquidity(m) + Δ_risk(W_deficit)
 
     Parameters
     ----------
@@ -79,9 +90,9 @@ def calculate_interest_rate(
     month : int
         Calendar month 1-12.
     rainfall : float
-        Actual rainfall this month.
-    optimal_rainfall : float
-        Optimal rainfall for the active crop (0.0 if fallow).
+        Expected rainfall this month (used as drought proxy).
+    optimal_water_level : float
+        Optimal water level for the active crop (0.0 if fallow).
 
     Returns
     -------
@@ -97,7 +108,7 @@ def calculate_interest_rate(
         delta_liquidity = 0.0
 
     # Risk premium (drought)
-    w_deficit = max(0.0, optimal_rainfall - rainfall)
+    w_deficit = max(0.0, optimal_water_level - rainfall)
     delta_risk = 0.05 if w_deficit > 0.3 else 0.0
 
     return max(0.0, base_rate + delta_liquidity + delta_risk)
@@ -110,8 +121,9 @@ def calculate_interest_rate(
 
 def _get_market_seasonal_multiplier(month: int, config: EnvConfig) -> float:
     """Return the seasonal price multiplier for the given month."""
-    for months_tuple, multiplier in config.market_seasonal_multipliers:
-        if month in months_tuple:
+    season = get_season(month)
+    for cfg_season, multiplier in config.market_seasonal_multipliers:
+        if cfg_season == season:
             return multiplier
     return 1.0
 
@@ -121,6 +133,7 @@ def generate_market_prices(
     config: EnvConfig,
     rng: np.random.Generator,
     prev_prices: Optional[Tuple[float, float, float]] = None,
+    effective_base_prices: Optional[Tuple[float, ...]] = None,
 ) -> Tuple[float, float, float]:
     """
     Generate market prices for each crop type.
@@ -135,10 +148,7 @@ def generate_market_prices(
         drift_i  = reversion_speed × (target_i - P_{t-1,i}) / target_i
         P_t(i)   = P_{t-1,i} × (1 + drift_i + ε_i)
 
-    Demand shocks: with probability `demand_shock_probability`, one random
-    crop gets a price spike or dip of 30-60%.
-
-    All prices are clamped to [1.0, base_i × price_max_multiplier].
+    All prices are clamped to [base × price_min_multiplier, base × price_max_multiplier].
 
     Parameters
     ----------
@@ -150,13 +160,11 @@ def generate_market_prices(
         Seeded random generator.
     prev_prices : tuple of 3 floats, optional
         Previous month's prices (used for autocorrelation mode).
-
-    Returns
-    -------
-    tuple of 3 floats
-        (price_crop1, price_crop2, price_crop3)
+    effective_base_prices : tuple of floats, optional
+        Inflated base prices. If None, uses config.base_market_prices.
     """
     seasonal_mult = _get_market_seasonal_multiplier(month, config)
+    base_prices = effective_base_prices or config.base_market_prices
     prices = []
 
     use_rw = (
@@ -165,7 +173,7 @@ def generate_market_prices(
     )
 
     for i in range(1, 4):  # crops 1, 2, 3
-        base = config.base_market_prices[i]
+        base = base_prices[i]
         target = base * seasonal_mult
         noise = rng.normal(0.0, config.market_price_sigma)
         # Clamp noise to ±3σ
@@ -173,29 +181,29 @@ def generate_market_prices(
                               3 * config.market_price_sigma))
 
         if use_rw:
-            # Mean-reverting random walk
             prev = prev_prices[i - 1]
             drift = config.price_reversion_speed * (target - prev) / max(target, 1.0)
             price = prev * (1.0 + drift + noise)
         else:
-            # Independent draw
             price = target * (1.0 + noise)
 
-        # Clamp: floor at 1.0, ceiling at base × max_multiplier
+        # Clamp: floor at base × min_multiplier, ceiling at base × max_multiplier
+        floor = base * config.price_min_multiplier
         ceiling = base * config.price_max_multiplier
-        price = float(np.clip(price, 1.0, ceiling))
+        price = float(np.clip(price, floor, ceiling))
         prices.append(price)
 
     # Demand shock: rare event affecting one random crop
     if config.demand_shock_probability > 0 and rng.random() < config.demand_shock_probability:
-        crop_idx = rng.integers(0, 3)  # which crop (0-indexed into prices list)
+        crop_idx = rng.integers(0, 3)
         direction = rng.choice([-1, 1])
         lo, hi = config.demand_shock_magnitude
         magnitude = rng.uniform(lo, hi)
         shock_mult = 1.0 + direction * magnitude
-        base = config.base_market_prices[crop_idx + 1]
+        base = base_prices[crop_idx + 1]
+        floor = base * config.price_min_multiplier
         ceiling = base * config.price_max_multiplier
-        prices[crop_idx] = float(np.clip(prices[crop_idx] * shock_mult, 1.0, ceiling))
+        prices[crop_idx] = float(np.clip(prices[crop_idx] * shock_mult, floor, ceiling))
 
     return (prices[0], prices[1], prices[2])
 
@@ -205,25 +213,100 @@ def generate_market_prices(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _maturity_factor(crop_age: int, growth_months: int) -> float:
+    """
+    Maturity sub-factor for yield.
+
+    - Age 0: always 0 (just planted).
+    - Growing: quadratic ramp (crop_age / growth_months)².
+    - Peak: 1.0 at exactly growth_months.
+    - Rotting: drops 0.5 per month past peak → reaches 0.0 in 2 months.
+    """
+    if crop_age == 0:
+        return 0.0
+    if crop_age < growth_months:
+        return (crop_age / growth_months) ** 2
+    months_over = crop_age - growth_months
+    return max(0.0, 1.0 - 0.5 * months_over)
+
+
+def _nitrogen_factor(soil_nitrogen: float, min_requirement: float) -> float:
+    """
+    Nitrogen sub-factor for yield (piecewise smooth saturation).
+
+    Below minimum requirement:
+        Linear ramp from 0 → 0.3 as nitrogen goes 0 → min_req.
+    Above minimum requirement:
+        Quadratic saturation from 0.3 → 1.0 as nitrogen goes min_req → 1.0.
+
+    Real-world analogy: Liebig's law of the minimum — below a threshold,
+    growth is severely limited. Above it, returns diminish.
+    """
+    if soil_nitrogen <= 0:
+        return 0.0
+    if min_requirement <= 0:
+        return 1.0
+    if soil_nitrogen < min_requirement:
+        return 0.3 * (soil_nitrogen / min_requirement)
+    # Above minimum: quadratic saturation toward 1.0
+    ratio = (soil_nitrogen - min_requirement) / (1.0 - min_requirement)
+    ratio = min(ratio, 1.0)  # guard against division issues
+    return 0.3 + 0.7 * (1.0 - (1.0 - ratio) ** 2)
+
+
+def _water_factor(current_water_level: float, optimal_water_level: float) -> float:
+    """
+    Water sub-factor for yield (square-root model).
+
+    Inspired by FAO crop-water response curves (Doorenbos & Kassam):
+    the first unit of water rescues a dying crop (high marginal value),
+    while topping up from 75% to 100% gives modest improvement.
+
+    - Full water (≥ optimal): 1.0
+    - Zero water: 0.1 (crop barely survives)
+    - In between: sqrt(ratio), floored at 0.1
+    """
+    if optimal_water_level <= 0:
+        return 1.0  # fallow, water irrelevant
+    if current_water_level >= optimal_water_level:
+        return 1.0
+    ratio = max(0.0, current_water_level / optimal_water_level)
+    return max(0.1, math.sqrt(ratio))
+
+
+def _season_factor(
+    month: int,
+    crop_type: int,
+    config: EnvConfig,
+) -> float:
+    """
+    Seasonal sub-factor for yield.
+
+    Returns 1.0 if the current season is optimal for this crop,
+    otherwise returns the configured penalty multiplier (default 0.4).
+    """
+    if crop_type == 0:
+        return 1.0
+    season = get_season(month)
+    optimal_seasons = config.optimal_seasons_per_crop[crop_type]
+    if season in optimal_seasons:
+        return 1.0
+    return config.non_optimal_season_multiplier
+
+
 def calculate_yield(
     crop_type: int,
     crop_age: int,
     soil_nitrogen: float,
-    rainfall: float,
-    irrigated: bool,
+    current_water_level: float,
+    current_month: int,
     config: EnvConfig,
     rng: Optional[np.random.Generator] = None,
 ) -> float:
     """
     Calculate harvest yield in tons.
 
-    yield = base_yield × nitrogen_factor × water_factor × maturity_factor × (1 + ε)
-
-    nitrogen_factor = clip(soil_nitrogen × 2, 0.3, 1.5)
-    water_factor    = max(0.2, 1.0 − deficit × 2)
-                      where deficit adjusted by irrigation
-    maturity_factor = 1.0 if mature, 0.3 if early harvest
-    ε ~ N(0, yield_sigma²)  -- harvest noise (if rng provided)
+    yield = base_yield × maturity × nitrogen × water × season × (1 + ε)
 
     Parameters
     ----------
@@ -233,15 +316,15 @@ def calculate_yield(
         Months since planting.
     soil_nitrogen : float
         Current soil nitrogen level (0-1).
-    rainfall : float
-        Actual rainfall this month.
-    irrigated : bool
-        Whether the agent irrigated this month.
+    current_water_level : float
+        Current water level in the field (0-1).
+    current_month : int
+        Calendar month 1-12 (for seasonal factor).
     config : EnvConfig
         Environment configuration.
     rng : np.random.Generator, optional
         If provided, adds Gaussian noise to yield. If None, yield is
-        deterministic (backward compatible for tests/expected_yield).
+        deterministic (used for expected_yield_potential).
 
     Returns
     -------
@@ -252,38 +335,19 @@ def calculate_yield(
         return 0.0
 
     base = config.base_yield_tons[crop_type]
+    maturity = _maturity_factor(crop_age, config.growth_months[crop_type])
+    nitrogen = _nitrogen_factor(soil_nitrogen, config.minimum_nitrogen_requirement[crop_type])
+    water = _water_factor(current_water_level, config.optimal_water_level[crop_type])
+    season = _season_factor(current_month, crop_type, config)
 
-    # Nitrogen factor
-    nitrogen_factor = float(np.clip(soil_nitrogen * 2.0, 0.3, 1.5))
-
-    # Water factor
-    optimal = config.optimal_rainfall[crop_type]
-    deficit = max(0.0, optimal - rainfall)
-    if irrigated:
-        deficit *= 0.3  # irrigation mitigates 70% of drought
-    water_factor = max(0.2, 1.0 - deficit * 2.0)
-
-    # Maturity factor: peaks at exactly required_months, lower before/after.
-    required_months = config.growth_months[crop_type]
-    if crop_age == 0:
-        maturity_factor = 0.0
-    elif crop_age < required_months:
-        maturity_factor = (crop_age / required_months) ** 2
-    else:
-        # Rotting: drops 50% per month past peak maturity
-        months_over = crop_age - required_months
-        maturity_factor = max(0.0, 1.0 - 0.5 * months_over)
-
-    deterministic_yield = base * nitrogen_factor * water_factor * maturity_factor
+    deterministic_yield = base * maturity * nitrogen * water * season
 
     # Yield noise (stochastic harvest outcomes)
     if rng is not None and config.yield_sigma > 0:
         noise = rng.normal(0.0, config.yield_sigma)
-        # Clamp noise to ±3σ to prevent extreme outliers
         noise = float(np.clip(noise, -3 * config.yield_sigma, 3 * config.yield_sigma))
         deterministic_yield *= (1.0 + noise)
 
-    # Floor at 0 — can't have negative yield
     return max(0.0, deterministic_yield)
 
 
@@ -296,35 +360,17 @@ def calculate_expected_yield_potential(
     crop_type: int,
     crop_age: int,
     soil_nitrogen: float,
-    expected_rainfall: float,
+    current_water_level: float,
+    current_month: int,
     config: EnvConfig,
 ) -> float:
     """
     Estimate the normalized yield potential if harvested this step.
 
-    This is a derived, read-only field in the observation. It gives the agent
-    information to decide whether to harvest now or wait for maturity.
-
     potential = raw_yield / max_possible_yield, clipped to [0.0, 1.0]
-    max_possible_yield = base_yield × 1.5 (max nitrogen factor)
+    max_possible_yield = base_yield × 1.0 (all sub-factors at maximum)
 
-    Parameters
-    ----------
-    crop_type : int
-        Current crop type (0 = fallow → returns 0.0).
-    crop_age : int
-        Months since planting.
-    soil_nitrogen : float
-        Current soil nitrogen level.
-    expected_rainfall : float
-        Expected rainfall for this month.
-    config : EnvConfig
-        Environment configuration.
-
-    Returns
-    -------
-    float
-        Normalized yield potential in [0.0, 1.0].
+    Uses deterministic yield (no noise) as a planning aide for the agent.
     """
     if crop_type == 0:
         return 0.0
@@ -333,12 +379,13 @@ def calculate_expected_yield_potential(
         crop_type=crop_type,
         crop_age=crop_age,
         soil_nitrogen=soil_nitrogen,
-        rainfall=expected_rainfall,
-        irrigated=False,  # conservative estimate without irrigation
+        current_water_level=current_water_level,
+        current_month=current_month,
         config=config,
+        rng=None,  # deterministic
     )
 
-    max_possible = config.base_yield_tons[crop_type] * 1.5  # max nitrogen factor
+    max_possible = config.base_yield_tons[crop_type]
     if max_possible <= 0:
         return 0.0
 
@@ -356,15 +403,6 @@ def apply_spoilage(
     """
     Check whether stored crop has spoiled.
 
-    Parameters
-    ----------
-    stored_age : int
-        Months since the crop was stored.
-    stored_amount : float
-        Current amount in storage.
-    max_age : int
-        Maximum storage age before rot.
-
     Returns
     -------
     (remaining_amount, spoiled)
@@ -380,38 +418,6 @@ def apply_spoilage(
 # G. Text Observation Formatter
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Season names for display
-_SEASON_MAP = {
-    1: "Winter",
-    2: "Spring",
-    3: "Spring",
-    4: "Summer",
-    5: "Summer",
-    6: "Monsoon",
-    7: "Monsoon",
-    8: "Monsoon",
-    9: "Monsoon",
-    10: "Winter",
-    11: "Winter",
-    12: "Winter",
-}
-
-_MONTH_NAMES = (
-    "",
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-)
-
 
 def format_text_observation(
     obs_dict: dict,
@@ -421,28 +427,12 @@ def format_text_observation(
 ) -> str:
     """
     Convert observation data into a human-readable text block for LLM agents.
-
-    Parameters
-    ----------
-    obs_dict : dict
-        Dictionary of observation field values.
-    config : EnvConfig
-        Environment config (for action names, crop names).
-    has_active_loan : bool
-        Whether the agent currently has an active loan.
-    valid_actions : list of int, optional
-        List of currently valid action IDs.
-
-    Returns
-    -------
-    str
-        Multi-line text summary.
     """
     month = obs_dict["current_month"]
     step = obs_dict["current_step"]
     max_steps = config.max_steps
-    season = _SEASON_MAP.get(month, "Unknown")
-    month_name = _MONTH_NAMES[month]
+    season = get_season(month)
+    month_name = MONTH_NAMES[month]
 
     crop_type = obs_dict["active_crop_type"]
     crop_name = config.crop_names[crop_type]
@@ -451,8 +441,8 @@ def format_text_observation(
     growth_req = config.growth_months[crop_type] if crop_type > 0 else 0
 
     lines = [
-        f"=== Farm Dashboard (Step {step}/{max_steps}) ===",
-        f"Month: {month_name} ({month}) | Season: {season}",
+        f"============= Farm Dashboard (Step {step}/{max_steps}) =============",
+        f"Month: {month_name} ({month}) | Season: {season.value}",
         f"Weather: Expected rainfall {obs_dict['expected_rainfall']:.2f}/1.0",
         "",
         "FARM STATUS:",
@@ -465,9 +455,8 @@ def format_text_observation(
             f"Active Crop: {crop_name} ({crop_cat}) | "
             f"Age: {crop_age}/{growth_req} months"
         )
-    lines.append(
-        f"Soil Nitrogen: {obs_dict['soil_nitrogen']:.2f}/1.0"
-    )
+    lines.append(f"Soil Nitrogen: {obs_dict['soil_nitrogen']:.2f}/1.0")
+    lines.append(f"Water Level: {obs_dict['current_water_level']:.2f}/1.0")
     lines.append(
         f"Expected Yield Potential: {obs_dict['expected_yield_potential']:.2f}/1.0"
     )
@@ -481,6 +470,9 @@ def format_text_observation(
     )
     lines.append(
         f"Interest Rate: {obs_dict['current_interest_rate'] * 100:.1f}% annual"
+    )
+    lines.append(
+        f"Land Value: ₹{obs_dict['current_land_price']:,.0f}"
     )
 
     lines.append("")
@@ -514,7 +506,8 @@ def format_text_observation(
     )
     lines.append(
         f"Irrigate: ₹{obs_dict['cost_irrigate']:,.0f} | "
-        f"Fertilize: ₹{obs_dict['cost_fertilize']:,.0f}"
+        f"Fertilize: ₹{obs_dict['cost_fertilize']:,.0f} | "
+        f"Monthly Fixed: ₹{obs_dict.get('monthly_fixed_cost', 0):,.0f}"
     )
 
     if valid_actions is not None:

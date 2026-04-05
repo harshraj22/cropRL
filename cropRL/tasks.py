@@ -15,15 +15,19 @@ TASKS: dict[str, dict] = {
     "easy": {
         "description": (
             "Maximize net worth over 60 months. Simplified conditions: "
-            "no interest on loans, stable weather, generous starting capital."
+            "no interest on loans, stable weather, generous starting capital, "
+            "no inflation."
         ),
         "config_overrides": {
             "initial_cash": 15000.0,
-            "base_interest_rate": 0.0,       # No loan interest
-            "weather_sigma": 0.05,            # Very predictable weather
-            "market_price_sigma": 0.05,       # Stable markets
-            "initial_soil_nitrogen": 0.8,     # Healthy soil
-            "max_storage_age": 12,            # Slow spoilage
+            "base_interest_rate": 0.0,
+            "weather_sigma": 0.05,
+            "weather_sigma_realisation": 0.02,
+            "market_price_sigma": 0.05,
+            "initial_soil_nitrogen": 0.8,
+            "max_storage_age": 12,
+            "inflation_rate": 0.0,
+            "monthly_fixed_cost": 100.0,
         },
     },
     "medium": {
@@ -37,15 +41,19 @@ TASKS: dict[str, dict] = {
     "hard": {
         "description": (
             "Maximize net worth over 60 months. Harsh conditions: "
-            "high interest, volatile weather and markets, poor starting soil."
+            "high interest, volatile weather and markets, poor starting soil, "
+            "high inflation."
         ),
         "config_overrides": {
             "initial_cash": 7000.0,
-            "base_interest_rate": 0.12,       # 12% interest
-            "weather_sigma": 0.25,            # Unpredictable weather
-            "market_price_sigma": 0.20,       # Volatile markets
-            "initial_soil_nitrogen": 0.35,    # Degraded soil
-            "max_storage_age": 4,             # Fast spoilage
+            "base_interest_rate": 0.12,
+            "weather_sigma": 0.25,
+            "weather_sigma_realisation": 0.08,
+            "market_price_sigma": 0.20,
+            "initial_soil_nitrogen": 0.35,
+            "max_storage_age": 4,
+            "inflation_rate": 0.07,
+            "monthly_fixed_cost": 300.0,
         },
     },
 }
@@ -67,7 +75,6 @@ def create_env_for_task(
     Returns
     -------
     CroprlEnvironment
-        Environment with task-specific configuration.
 
     Raises
     ------
@@ -90,20 +97,22 @@ def list_tasks() -> dict[str, str]:
     return {tid: info["description"] for tid, info in TASKS.items()}
 
 
-def grader(task_id: str, final_net_worth: float, bankrupt: bool, trajectory: list[dict] = None) -> float:
+def grader(
+    task_id: str,
+    final_net_worth: float,
+    bankrupt: bool,
+    trajectory: list[dict] | None = None,
+) -> float:
     """
-    Grade the agent's performance on a 0.0 - 1.0 scale.
-    
-    This grader uses an "Empirical Oracle Upper Bound" approach to handle stochasticity safely.
-    Because weather and market prices are randomly generated, a fixed theoretical ceiling 
-    punishes agents with bad RNG and breaks the 1.0 limit for lucky agents. 
-    
-    Instead, we reconstruct the maximum net worth specifically for the exactly dealt 
-    prices the agent experienced. We calculate the absolute peak monthly profit potential 
-    at each step, assuming maximum theoretical crop yields.
-    
-    Score = (Agent Net Worth - Baseline) / (Oracle Upper Bound - Baseline)
-    
+    Grade the agent's performance on a 0.0 – 1.0 scale.
+
+    Uses an "Empirical Oracle Upper Bound" approach.  The oracle
+    calculates the theoretical maximum monthly profit from the exact
+    market prices the agent experienced, using the new 4-factor yield
+    formula at peak conditions.
+
+    Score = (Agent Net Worth − Baseline) / (Oracle Upper Bound − Baseline)
+
     Parameters
     ----------
     task_id : str
@@ -114,7 +123,7 @@ def grader(task_id: str, final_net_worth: float, bankrupt: bool, trajectory: lis
         Whether the agent went bankrupt.
     trajectory : list[dict]
         Chronological list of step data containing exact market prices.
-        
+
     Returns
     -------
     float
@@ -122,37 +131,43 @@ def grader(task_id: str, final_net_worth: float, bankrupt: bool, trajectory: lis
     """
     if bankrupt or final_net_worth <= 0 or not trajectory:
         return 0.0
-        
-    # Minimum baseline: what the agent gets doing literally nothing.
-    baseline_min = 10000.0  
-    
+
+    # Reconstruct config for this task to get initial values
+    overrides = TASKS.get(task_id, {}).get("config_overrides", {})
+    cfg = EnvConfig(**overrides)
+
+    # Baseline: net worth if agent does absolutely nothing for 60 months
+    # Cash stays, land value stays, no crops, no debt
+    # But monthly fixed cost erodes cash: 60 months × fixed_cost
+    baseline_cash = cfg.initial_cash - (cfg.max_months * cfg.monthly_fixed_cost)
+    baseline_land = cfg.base_land_price * cfg.initial_soil_nitrogen
+    baseline_min = baseline_cash + baseline_land
+
     if final_net_worth <= baseline_min:
         return 0.0
 
-    # Calculate Oracle Upper Bound from strictly this episode's market prices
-    # Maximum possible nitrogen factor is mathematically floored at 1.5x of base yields
-    # Corn base 8.0 * 1.5 = 12.0 tons
-    # Wheat base 5.0 * 1.5 = 7.5 tons
-    # Chickpea base 3.0 * 1.5 = 4.5 tons
+    # Oracle Upper Bound: maximum possible profit from these prices
+    # Assumes perfect nitrogen (factor=1.0), full water (factor=1.0),
+    # optimal season (factor=1.0), peak maturity (factor=1.0)
+    # → yield = base_yield_tons[crop] at maximum
     total_oracle_profit = 0.0
-    
+
     for step_data in trajectory:
-        # Extract the prices logged at this step (fallback to base configs if malformed)
         prices = step_data.get("prices", [1200.0, 800.0, 500.0])
-        
-        # Monthly amortized profit potentials: (Price * MaxYield - SeedCost) / GrowthMonths
-        corn_prof = ((prices[0] * 12.0) - 800.0) / 4.0
-        wheat_prof = ((prices[1] * 7.5) - 500.0) / 3.0
-        chickpea_prof = ((prices[2] * 4.5) - 200.0) / 3.0
-        
-        # A theoretical oracle farmer gets the most profitable crop's value this month
+
+        # Monthly amortized profit: (price × max_yield − seed_cost) / growth_months
+        corn_prof = ((prices[0] * 8.0) - 800.0) / 4.0
+        wheat_prof = ((prices[1] * 5.0) - 500.0) / 3.0
+        chickpea_prof = ((prices[2] * 3.0) - 200.0) / 3.0
+
         total_oracle_profit += max(0.0, corn_prof, wheat_prof, chickpea_prof)
-        
-    # Max possible net worth = Starting Cash + Max Perfect Soil Bonus + Oracle Farm Profit
-    oracle_max_net_worth = 10000.0 + 10000.0 + total_oracle_profit
-    
-    # Standard min-max normalization
-    score = (final_net_worth - baseline_min) / (oracle_max_net_worth - baseline_min)
-    
-    # Clamp mathematically guarantees we never violate hackathon bounds
+
+    # Oracle max net worth includes perfect soil maintenance
+    oracle_land = cfg.base_land_price * 1.0  # perfect nitrogen
+    oracle_max = cfg.initial_cash + oracle_land + total_oracle_profit
+
+    if oracle_max <= baseline_min:
+        return 0.5  # edge case: prices so bad oracle can't beat baseline
+
+    score = (final_net_worth - baseline_min) / (oracle_max - baseline_min)
     return float(max(0.0, min(1.0, score)))

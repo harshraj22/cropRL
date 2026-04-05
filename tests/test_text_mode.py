@@ -3,11 +3,12 @@
 from cropRL.config import EnvConfig
 from cropRL.models import CroprlAction
 from cropRL.server.cropRL_environment import CroprlEnvironment
+from cropRL.enums import ActionType
 
 
 class TestTextMode:
     def test_text_mode_off_no_summary(self, env):
-        obs = env.step(CroprlAction(action_id=0))
+        obs = env.step(CroprlAction(action_id=ActionType.WAIT))
         assert obs.text_summary == ""
 
     def test_text_mode_on_has_summary(self):
@@ -24,3 +25,5 @@ class TestTextMode:
         assert "January" in obs.text_summary
         assert "Soil Nitrogen" in obs.text_summary
         assert "Cash" in obs.text_summary
+        assert "Water Level" in obs.text_summary
+        assert "Land Value" in obs.text_summary
