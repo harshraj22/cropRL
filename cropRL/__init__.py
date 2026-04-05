@@ -7,10 +7,14 @@
 """Croprl Environment."""
 
 from .client import CroprlEnv
+from .enums import ActionType, CropType, Season
 from .models import CroprlAction, CroprlObservation
 
 __all__ = [
+    "ActionType",
+    "CropType",
     "CroprlAction",
-    "CroprlObservation",
     "CroprlEnv",
+    "CroprlObservation",
+    "Season",
 ]

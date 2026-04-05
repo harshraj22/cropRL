@@ -215,9 +215,11 @@ def _obs_to_dict(obs) -> dict:
         "crop_age_months": obs.crop_age_months,
         "expected_yield_potential": round(obs.expected_yield_potential, 4),
         "soil_nitrogen": round(obs.soil_nitrogen, 4),
+        "current_water_level": round(obs.current_water_level, 4),
         "cash_balance": round(obs.cash_balance, 2),
         "current_debt": round(obs.current_debt, 2),
         "current_interest_rate": round(obs.current_interest_rate, 4),
+        "current_land_price": round(obs.current_land_price, 2),
         "market_prices": {
             "corn": round(obs.market_price_crop_1, 2),
             "wheat": round(obs.market_price_crop_2, 2),
