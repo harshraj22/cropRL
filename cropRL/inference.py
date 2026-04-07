@@ -181,6 +181,10 @@ def run_episode(client: OpenAI, task_id: str):
 
     log_start(task=task_id, env="croprl", model=MODEL_NAME)
 
+    # Log initial observation so we can clearly see the starting state
+    obs_details = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
+    print(f"\n[OBSERVATION - INITIAL]\n{obs_details}\n", flush=True)
+
     trajectory = []
 
     try:
@@ -238,6 +242,7 @@ def run_episode(client: OpenAI, task_id: str):
             obs.done and obs.cash_balance < 0,
             trajectory,
         )
+        score = max(0.01, min(0.99, score))
 
         success = score >= 0.1
 

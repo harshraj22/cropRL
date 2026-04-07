@@ -5,3 +5,11 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+
+tasks:
+  - id: easy
+    grader: cropRL.tasks:EasyGrader
+  - id: medium
+    grader: cropRL.tasks:MediumGrader
+  - id: hard
+    grader: cropRL.tasks:HardGrader
