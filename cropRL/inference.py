@@ -13,6 +13,7 @@ STDOUT FORMAT
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -20,17 +21,39 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ollama
+from openai import OpenAI
 
 from cropRL.tasks import create_env_for_task, grader
 from cropRL.models import CroprlAction
 from cropRL.enums import ActionType, CropType
 
 # ── Configuration ──────────────────────────────────────────────
+USE_OPENROUTER = os.getenv("USE_OPENROUTER", "false").lower() == "true"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:11434/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "ollama")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3:8b")
+
+if USE_OPENROUTER:
+    MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3.6-plus:free")
+else:
+    MODEL_NAME = os.getenv("MODEL_NAME", "qwen3:8b")
+
+# Multi-model fallback list for OpenRouter free tier
+OPENROUTER_FALLBACK_MODELS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "minimax/minimax-m2.5:free",
+    "openai/gpt-oss-120b:free"
+]
+
+# Proactive Rotation State
+CURRENT_MODEL_INDEX = 0
+
 TEMPERATURE = 0.4  # Increased to allow for creative reasoning
 MAX_TOKENS = 2048  # Sufficient for qwen3:8b reasoning on M1 Pro
+STEP_DELAY = float(os.getenv("STEP_DELAY", "2.0"))  # Seconds to sleep between steps to avoid rate limits
+RETRY_BASE_DELAY = 2.0  # Base delay for exponential backoff during rate limits
 
 SYSTEM_PROMPT = """\
 You are an expert farm manager AI. You manage a small Indian farm over 60 months.
@@ -53,13 +76,10 @@ ACTIONS (use the action integer):
 KEY RULES:
 - Only Wait (action 0) advances the calendar month. Other actions are instant.
 - Can only plant on fallow (empty) land.
-- Can only harvest crops aged >= 1 month. Crops mature at 3-4 months for full yield.
-- Storage rots after 6 months. Only one slot.
+- Can only harvest crops aged >= 1 month.
+- Only one crop can be stored at a time.
 - One loan at a time. Must repay full amount. Interest uses rate when loan was taken.
-- Soil nitrogen is crucial: low N = poor yields. Chickpeas restore N, Corn destroys it.
-- Water level matters: irrigate during dry seasons to maintain crop health.
-- Growing crops in their optimal season gives much better yields.
-- Inflation increases costs each year.
+- Soil nitrogen is crucial: low N = poor yields.
 - Monthly fixed costs are deducted every month.
 - Bankruptcy (negative cash + loan) ends the game with heavy penalty.
 
@@ -178,41 +198,96 @@ def parse_action(response_text: str, fallback_action: int) -> int:
 
 
 def get_model_action(obs, history: List[str]) -> int:
+    global CURRENT_MODEL_INDEX
     fallback = rule_based_agent(obs)
     user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
 
-    history_block = "\n".join(history[-20:]) if history else "None"
+    # Use larger history window for high-potential models
+    history_block = "\n".join(history[-50:]) if history else "None"
     user_msg += f"\n\nRecent History:\n{history_block}"
 
-    try:
-        response_text = ""
-        # Separate headers for thought visibility
-        print(f"\n--- Model Reasoning (Step {obs.current_step}) ---", flush=True)
+    # Debug: Print the exact message being sent to the LLM
+    print(f"\n--- [LLM PROMPT] ---\n{user_msg}\n--- [/LLM PROMPT] ---\n", flush=True)
 
-        stream = ollama.chat(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            stream=True,
-            options={
-                "temperature": TEMPERATURE,
-                "num_predict": MAX_TOKENS,
-            }
-        )
+    base_models = [MODEL_NAME]
+    if USE_OPENROUTER:
+        base_models += OPENROUTER_FALLBACK_MODELS
 
-        for chunk in stream:
-            content = chunk['message']['content']
-            print(content, end='', flush=True)
-            response_text += content
+    # Reorder models based on CURRENT_MODEL_INDEX for rotation
+    models_count = len(base_models)
+    models_to_try = [base_models[(CURRENT_MODEL_INDEX + i) % models_count] for i in range(models_count)]
 
-        print(f"\n--- End Reasoning ---\n", flush=True)
+    for attempt, current_model in enumerate(models_to_try):
+        try:
+            response_text = ""
+            print(f"\n--- Model Reasoning ({current_model} | Step {obs.current_step}) ---", flush=True)
 
-        return parse_action(response_text, fallback)
-    except Exception as e:
-        print(f"[DEBUG] Ollama error: {e}", file=sys.stderr)
-        return fallback
+            if USE_OPENROUTER:
+                client = OpenAI(
+                    base_url=OPENROUTER_BASE_URL,
+                    api_key=OPENROUTER_API_KEY,
+                    default_headers={
+                        "HTTP-Referer": "https://github.com/OpenEnv/CropRL",
+                        "X-Title": "CropRL Inference",
+                    }
+                )
+
+                stream = client.chat.completions.create(
+                    model=current_model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    stream=True,
+                )
+
+                for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        print(content, end='', flush=True)
+                        response_text += content
+            else:
+                stream = ollama.chat(
+                    model=current_model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    stream=True,
+                    options={
+                        "temperature": TEMPERATURE,
+                        "num_predict": MAX_TOKENS,
+                    }
+                )
+
+                for chunk in stream:
+                    content = chunk['message']['content']
+                    print(content, end='', flush=True)
+                    response_text += content
+
+            print(f"\n--- End Reasoning ---\n", flush=True)
+
+            # Successfully got action, update index for next call to rotate
+            internal_idx = base_models.index(current_model)
+            CURRENT_MODEL_INDEX = (internal_idx + 1) % models_count
+
+            return parse_action(response_text, fallback)
+
+        except Exception as e:
+            if attempt < models_count - 1:
+                wait_time = RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"\n[ERROR] Error on {current_model}: {e}. Switching models in {wait_time:.1f}s...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue # Pivot to next model in the list
+            else:
+                provider = "OpenRouter" if USE_OPENROUTER else "Ollama"
+                print(f"[DEBUG] {provider} final failure on {current_model}: {e}", file=sys.stderr)
+                # Keep current index for next step attempt
+                return fallback
+
+    return fallback
 
 
 def run_episode(task_id: str):
@@ -268,6 +343,10 @@ def run_episode(task_id: str):
                     obs.market_price_crop_3,
                 ]
             })
+
+            # Rate limiting protection
+            if STEP_DELAY > 0:
+                time.sleep(STEP_DELAY)
 
             if done:
                 break
