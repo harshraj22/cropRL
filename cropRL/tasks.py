@@ -130,7 +130,7 @@ def grader(
         A score clamped between 0.0 and 1.0.
     """
     if bankrupt or final_net_worth <= 0 or not trajectory:
-        return 0.0
+        return 0.01
 
     # Reconstruct config for this task to get initial values
     overrides = TASKS.get(task_id, {}).get("config_overrides", {})
@@ -144,7 +144,7 @@ def grader(
     baseline_min = baseline_cash + baseline_land
 
     if final_net_worth <= baseline_min:
-        return 0.0
+        return 0.01
 
     # Oracle Upper Bound: maximum possible profit from these prices
     # Assumes perfect nitrogen (factor=1.0), full water (factor=1.0),
@@ -170,4 +170,16 @@ def grader(
         return 0.5  # edge case: prices so bad oracle can't beat baseline
 
     score = (final_net_worth - baseline_min) / (oracle_max - baseline_min)
-    return float(max(0.0, min(1.0, score)))
+    return float(max(0.01, min(0.99, score)))
+
+class EasyGrader:
+    def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
+        return max(0.01, min(0.99, grader("easy", final_net_worth, bankrupt, trajectory)))
+
+class MediumGrader:
+    def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
+        return max(0.01, min(0.99, grader("medium", final_net_worth, bankrupt, trajectory)))
+
+class HardGrader:
+    def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
+        return max(0.01, min(0.99, grader("hard", final_net_worth, bankrupt, trajectory)))
