@@ -17,7 +17,7 @@ class CroprlAction(Action):
         description="Discrete action index (0-10)",
         json_schema_extra={
             "enum": [
-                ["0 - Wait (do nothing)", 0],
+                ["0 - Wait till next month (do nothing)", 0],
                 ["1 - Plant Crop 1 (Corn / Heavy Feeder)", 1],
                 ["2 - Plant Crop 2 (Wheat / Medium Feeder)", 2],
                 ["3 - Plant Crop 3 (Chickpea / Legume)", 3],

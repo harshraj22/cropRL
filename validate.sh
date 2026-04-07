@@ -47,7 +47,7 @@ run_with_timeout() {
   else
     "$@" &
     local pid=$!
-    ( sleep "$secs" && kill "$pid" 2>/dev/null ) &
+    ( sleep "$secs" && kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     local watcher=$!
  wait "$pid" 2>/dev/null
  local rc=$?
