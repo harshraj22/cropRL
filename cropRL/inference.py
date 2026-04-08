@@ -39,9 +39,9 @@ OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by th
 
 ACTIONS (reply with ONLY the action number):
 0: Wait — End this month and advance to the next. Monthly costs deducted.
-1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. Best in Monsoon.
+1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. 
 2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
-3: Plant Chickpea — Low cost, lower yield, RESTORES soil nitrogen. Best in Winter/Spring.
+3: Plant Chickpea — Low cost, lower yield, RESTORES soil nitrogen. 
 4: Irrigate — Adds water to field instantly. Critical during dry months.
 5: Fertilize — Boosts soil nitrogen by 0.15 instantly.
 6: Harvest & Store — Harvest crop and store it (auto-sells old storage).
@@ -53,11 +53,11 @@ ACTIONS (reply with ONLY the action number):
 KEY RULES:
 - Only Wait (action 0) advances the calendar month. Other actions are instant.
 - Can only plant on fallow (empty) land.
-- Can only harvest crops aged >= 1 month. Crops mature at 3-4 months for full yield.
+- Can only harvest crops aged >= 1 month. 
 - Storage rots after 6 months. Only one slot.
 - One loan at a time. Must repay full amount. Interest uses rate when loan was taken.
 - Soil nitrogen is crucial: low N = poor yields. Chickpeas restore N, Corn destroys it.
-- Water level matters: irrigate during dry seasons to maintain crop health.
+- Water level matters.
 - Growing crops in their optimal season gives much better yields.
 - Inflation increases costs each year.
 - Monthly fixed costs are deducted every month.
