@@ -8,7 +8,7 @@ The goal is to **maximize net worth** (cash + asset value − debt) by the end o
 
 ## Motivation & Real-World Utility
 
-### Why Agriculture?
+### Why CropRL is a Strong RL Benchmark
 
 Farming is one of the oldest sequential decision-making problems. Every month, a farmer faces choices with **delayed, uncertain outcomes**:
 
@@ -16,7 +16,12 @@ Farming is one of the oldest sequential decision-making problems. Every month, a
 - Should I sell now at a low price, or store the harvest and gamble on prices rising — knowing it might rot?
 - Rain has been poor this year. Do I take a loan to irrigate, adding debt with interest?
 
-These are the same exploration-exploitation, risk-reward, and long-horizon planning tradeoffs that make RL interesting — grounded in a domain people can intuitively understand.
+These dynamics make CropRL an excellent benchmark for modern Reinforcement Learning algorithms by blending several classical challenges into a single, intuitive package:
+
+- **Multi-Domain Mastery:** The agent must simultaneously learn agronomy (crop rotation, soil depletion, weather cycles), financial management (debt traps, interest rates, inflation), and market speculation (mean-reverting price trends, inventory spoilage).
+- **Single Unifying Objective:** Despite the multi-domain complexity, the agent is trained on a single primary goal: maximizing terminal net worth. It must internally figure out how to balance competing sub-goals (e.g., extracting short-term cash vs. preserving soil nitrogen) without hand-crafted, multi-objective reward shaping.
+- **Harsh Real-World Constraints:** The environment imposes strict physical and financial bounds. Inflation and compounding interest erode idle cash or loan value, crops have strict physiological development times, and unmitigated weather shocks permanently limit yield potential.
+- **Delayed Consequences:** Actions have incredibly long-tail outcomes. Planting corn today ensures a large harvest in 4 months but destroys the soil's yield capacity for the following year. Taking a loan today saves a crop but applies compounding financial pressure for seasons to come.
 
 ### The Indian Context
 
