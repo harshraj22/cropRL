@@ -14,6 +14,7 @@ version = "0.2.0"
 description = "Croprl environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
+    "ollama>=0.6.1",
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
