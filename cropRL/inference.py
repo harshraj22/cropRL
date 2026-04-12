@@ -36,22 +36,27 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:11434/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "ollama")
 
 if USE_OPENROUTER:
-    MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3.6-plus:free")
+    # MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3.6-plus:free")
+    MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-4-31b-it:free")
 else:
     MODEL_NAME = os.getenv("MODEL_NAME", "qwen3:8b")
 
 # Multi-model fallback list for OpenRouter free tier
 OPENROUTER_FALLBACK_MODELS = [
+    "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
     "minimax/minimax-m2.5:free",
-    "openai/gpt-oss-120b:free"
+    "openai/gpt-oss-120b:free",
+    "openai/gpt-oss-20b:free",
+    "qwen/qwen3-coder:free"
 ]
 
 # Proactive Rotation State
 CURRENT_MODEL_INDEX = 0
 
 TEMPERATURE = 0.4  # Increased to allow for creative reasoning
-MAX_TOKENS = 2048  # Sufficient for qwen3:8b reasoning on M1 Pro
+MAX_TOKENS = 8192
 STEP_DELAY = float(os.getenv("STEP_DELAY", "2.0"))  # Seconds to sleep between steps to avoid rate limits
 RETRY_BASE_DELAY = 2.0  # Base delay for exponential backoff during rate limits
 
@@ -62,16 +67,18 @@ OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by th
 
 ACTIONS (use the action integer):
 0: Wait — End this month and advance to the next. Monthly costs deducted.
-1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. Best in Monsoon.
-2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
-3: Plant Chickpea — Low cost, lower yield, RESTORES soil nitrogen. Best in Winter/Spring.
-4: Irrigate — Adds water to field instantly. Critical during dry months.
+1: Plant Corn
+2: Plant Wheat
+3: Plant Chickpea
+4: Irrigate — Adds water to field instantly. Different crops have different amount of water added to them by irrigation.
 5: Fertilize — Boosts soil nitrogen by 0.15 instantly.
 6: Harvest & Store — Harvest crop and store it (auto-sells old storage).
 7: Harvest & Sell — Harvest crop and sell immediately at market price.
 8: Sell Inventory — Sell stored crops at current market price.
 9: Take Loan — Get cash (only if no active loan). Interest locked at current rate.
 10: Repay Loan — Pay off full debt (must have enough cash).
+NOTE: The water_level metric in observations is normalized to a maximum of 1, representing the land's full water holding capacity. Different crops have different optimal water requirements.
+THINKING: Keep your chain-of-thought concise and reasonable, avoiding overly long deliberations.
 
 KEY RULES:
 - Only Wait (action 0) advances the calendar month. Other actions are instant.
@@ -79,7 +86,6 @@ KEY RULES:
 - Can only harvest crops aged >= 1 month.
 - Only one crop can be stored at a time.
 - One loan at a time. Must repay full amount. Interest uses rate when loan was taken.
-- Soil nitrogen is crucial: low N = poor yields.
 - Monthly fixed costs are deducted every month.
 - Bankruptcy (negative cash + loan) ends the game with heavy penalty.
 
