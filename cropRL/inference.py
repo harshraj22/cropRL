@@ -55,7 +55,13 @@ OPENROUTER_FALLBACK_MODELS = [
 # Proactive Rotation State
 CURRENT_MODEL_INDEX = 0
 
-TEMPERATURE = 0.4  # Increased to allow for creative reasoning
+# Default temperature (thinking level)
+TEMPERATURE = 0.4  # Creative reasoning
+
+# Medium thinking level for Ollama qwen3.5:9b model
+if not USE_OPENROUTER and MODEL_NAME.startswith("qwen3.5:9b"):
+    TEMPERATURE = 0.6  # Medium thinking
+
 MAX_TOKENS = 8192
 STEP_DELAY = float(os.getenv("STEP_DELAY", "2.0"))  # Seconds to sleep between steps to avoid rate limits
 RETRY_BASE_DELAY = 2.0  # Base delay for exponential backoff during rate limits
