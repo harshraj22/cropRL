@@ -1,15 +1,24 @@
 """
 CropRL Task Definitions.
 
-Three tasks with the same objective (maximize net worth over 60 months)
-but different environment complexity levels.
+Three single-agent tasks with the same objective (maximize net worth over
+60 months) at different difficulty levels.
+
+Multi-agent task variants are also provided:
+  easy_2agent, easy_4agent, easy_8agent
+  medium_2agent, medium_4agent, medium_8agent
+  hard_2agent, hard_4agent, hard_8agent
 """
 
 from __future__ import annotations
 
-from .config import EnvConfig
+from typing import Optional
+
+from .config import EnvConfig, MultiAgentConfig
 from .server.cropRL_environment import CroprlEnvironment
 
+
+# ── Single-agent tasks ──────────────────────────────────────────────────────
 
 TASKS: dict[str, dict] = {
     "easy": {
@@ -58,6 +67,26 @@ TASKS: dict[str, dict] = {
     },
 }
 
+# ── Multi-agent task variants ───────────────────────────────────────────────
+# Injected after TASKS is defined so config_overrides references are valid.
+
+for _difficulty in ("easy", "medium", "hard"):
+    for _n in (2, 4, 8):
+        _key = f"{_difficulty}_{_n}agent"
+        TASKS[_key] = {
+            "description": (
+                f"Multi-agent ({_n} farms) variant of the '{_difficulty}' task. "
+                "Agents compete on a shared market with supply-demand pricing "
+                "and hype crop cycles."
+            ),
+            "config_overrides": TASKS[_difficulty]["config_overrides"],
+            "multi_agent": True,
+            "num_agents": _n,
+        }
+
+
+# ── Environment factories ───────────────────────────────────────────────────
+
 
 def create_env_for_task(
     task_id: str, text_mode: bool = False
@@ -68,7 +97,7 @@ def create_env_for_task(
     Parameters
     ----------
     task_id : str
-        One of "easy", "medium", "hard".
+        One of ``"easy"``, ``"medium"``, ``"hard"``.
     text_mode : bool
         Whether to enable text observation mode (for LLM agents).
 
@@ -92,9 +121,56 @@ def create_env_for_task(
     return CroprlEnvironment(config=config, task_id=task_id)
 
 
+def create_multi_agent_env_for_task(
+    task_id: str,
+    text_mode: bool = False,
+    objective_mode: str = "competitive",
+) -> "MultiAgentCroprlEnvironment":
+    """
+    Create a MultiAgentCroprlEnvironment configured for the given multi-agent task.
+
+    Parameters
+    ----------
+    task_id : str
+        A multi-agent task id, e.g. ``"easy_4agent"`` or ``"hard_8agent"``.
+    text_mode : bool
+        Enable text observation mode (for LLM agents).
+    objective_mode : str
+        ``"competitive"``, ``"cooperative"``, or ``"mixed"``.
+
+    Returns
+    -------
+    MultiAgentCroprlEnvironment
+    """
+    from .multi_agent_environment import MultiAgentCroprlEnvironment
+
+    if task_id not in TASKS:
+        raise KeyError(
+            f"Unknown task '{task_id}'. Available: {list(TASKS.keys())}"
+        )
+
+    task_info = TASKS[task_id]
+    num_agents = task_info.get("num_agents", 4)
+    overrides = task_info["config_overrides"].copy()
+    overrides["text_mode"] = text_mode
+    env_cfg = EnvConfig(**overrides)
+    ma_cfg = MultiAgentConfig(
+        num_agents=num_agents,
+        objective_mode=objective_mode,
+    )
+    return MultiAgentCroprlEnvironment(
+        env_config=env_cfg,
+        ma_config=ma_cfg,
+        task_id=task_id,
+    )
+
+
 def list_tasks() -> dict[str, str]:
     """Return a dict of task_id → description."""
     return {tid: info["description"] for tid, info in TASKS.items()}
+
+
+# ── Grading ─────────────────────────────────────────────────────────────────
 
 
 def grader(
@@ -116,7 +192,9 @@ def grader(
     Parameters
     ----------
     task_id : str
-        The task that was executed ("easy", "medium", "hard").
+        The task that was executed (``"easy"``, ``"medium"``, ``"hard"``).
+        Multi-agent task ids (e.g. ``"medium_4agent"``) are also accepted;
+        the base difficulty will be extracted automatically.
     final_net_worth : float
         The agent's net worth at the end of the episode.
     bankrupt : bool
@@ -132,13 +210,17 @@ def grader(
     if bankrupt or final_net_worth <= 0 or not trajectory:
         return 0.01
 
+    # Resolve base task (strip multi-agent suffix like "_4agent")
+    base_task = task_id
+    for _n in (2, 4, 8):
+        base_task = base_task.replace(f"_{_n}agent", "")
+    base_task = base_task if base_task in ("easy", "medium", "hard") else "medium"
+
     # Reconstruct config for this task to get initial values
-    overrides = TASKS.get(task_id, {}).get("config_overrides", {})
+    overrides = TASKS.get(base_task, {}).get("config_overrides", {})
     cfg = EnvConfig(**overrides)
 
     # Baseline: net worth if agent does absolutely nothing for 60 months
-    # Cash stays, land value stays, no crops, no debt
-    # But monthly fixed cost erodes cash: 60 months × fixed_cost
     baseline_cash = cfg.initial_cash - (cfg.max_months * cfg.monthly_fixed_cost)
     baseline_land = cfg.base_land_price * cfg.initial_soil_nitrogen
     baseline_min = baseline_cash + baseline_land
@@ -147,9 +229,7 @@ def grader(
         return 0.01
 
     # Oracle Upper Bound: maximum possible profit from these prices
-    # Assumes perfect nitrogen (factor=1.0), full water (factor=1.0),
-    # optimal season (factor=1.0), peak maturity (factor=1.0)
-    # → yield = base_yield_tons[crop] at maximum
+    # Assumes perfect conditions (nitrogen=1, water=1, optimal season, peak maturity)
     total_oracle_profit = 0.0
 
     for step_data in trajectory:
@@ -172,14 +252,151 @@ def grader(
     score = (final_net_worth - baseline_min) / (oracle_max - baseline_min)
     return float(max(0.01, min(0.99, score)))
 
+
+# ── Single-agent grader classes ─────────────────────────────────────────────
+
+
 class EasyGrader:
     def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
         return max(0.01, min(0.99, grader("easy", final_net_worth, bankrupt, trajectory)))
+
 
 class MediumGrader:
     def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
         return max(0.01, min(0.99, grader("medium", final_net_worth, bankrupt, trajectory)))
 
+
 class HardGrader:
     def grade(self, final_net_worth: float, bankrupt: bool, trajectory: list[dict] | None = None) -> float:
         return max(0.01, min(0.99, grader("hard", final_net_worth, bankrupt, trajectory)))
+
+
+# ── Multi-agent grader ──────────────────────────────────────────────────────
+
+
+class MultiAgentGrader:
+    """
+    Grader for multi-agent episodes.
+
+    Delegates per-agent scoring to the single-agent ``grader()`` and
+    aggregates the result via ``MultiAgentCroprlEnvironment.compute_result()``.
+    """
+
+    def __init__(self, task_id: str = "medium_4agent") -> None:
+        self.task_id = task_id
+
+    def grade(
+        self,
+        env: "MultiAgentCroprlEnvironment",  # noqa: F821
+        trajectories: Optional[dict] = None,
+    ) -> "MultiAgentResult":  # noqa: F821
+        """Return a MultiAgentResult for a completed episode."""
+        return env.compute_result(trajectories)
+
+
+# ── Rule-based agent helper ─────────────────────────────────────────────────
+
+
+def _rule_based_action(obs: "MultiAgentObservation") -> int:  # noqa: F821
+    """
+    Simple deterministic agent used for smoke-testing multi-agent episodes.
+    Priority: harvest if mature → plant if fallow → irrigate → end turn.
+    """
+    from .enums import ActionType, CropType
+
+    s_crop = obs.active_crop_type
+    s_age = obs.crop_age_months
+    s_water = obs.current_water_level
+
+    # Harvest if crop is mature or rotting
+    if s_crop != CropType.FALLOW and s_age >= 3:
+        return ActionType.HARVEST_SELL
+
+    # Plant corn if fallow and have cash
+    if s_crop == CropType.FALLOW and obs.cash_balance >= obs.cost_seed_1:
+        return ActionType.PLANT_CORN
+
+    # Irrigate if water is low
+    if (s_crop != CropType.FALLOW
+            and s_water < 0.3
+            and obs.cash_balance >= obs.cost_irrigate):
+        return ActionType.IRRIGATE
+
+    return ActionType.END_TURN
+
+
+# ── Multi-agent episode runner ──────────────────────────────────────────────
+
+
+def run_multi_agent_episode(
+    task_id: str = "medium_4agent",
+    num_agents: Optional[int] = None,
+    seed: int = 42,
+    agent_fn=None,
+    verbose: bool = False,
+) -> "MultiAgentResult":  # noqa: F821
+    """
+    Run a complete multi-agent episode with rule-based (or custom) agents.
+
+    Parameters
+    ----------
+    task_id : str
+        Multi-agent task identifier, e.g. ``"easy_4agent"``, ``"hard_8agent"``.
+    num_agents : int, optional
+        Override the number of agents (default: read from task_id).
+    seed : int
+        Global random seed.
+    agent_fn : callable, optional
+        ``(agent_id, observation) -> action_id``.
+        Defaults to the built-in rule-based agent.
+    verbose : bool
+        Print step messages when True.
+
+    Returns
+    -------
+    MultiAgentResult
+        Episode scoring result.
+    """
+    from .multi_agent_environment import MultiAgentCroprlEnvironment
+    from .models import MultiAgentAction
+
+    task_info = TASKS.get(task_id, {})
+    n = num_agents or task_info.get("num_agents", 4)
+    overrides = task_info.get("config_overrides", {})
+    env_cfg = EnvConfig(**overrides)
+    ma_cfg = MultiAgentConfig(num_agents=n)
+    env = MultiAgentCroprlEnvironment(
+        env_config=env_cfg, ma_config=ma_cfg, task_id=task_id
+    )
+
+    observations = env.reset(seed=seed)
+    trajectories: dict = {i: [] for i in range(n)}
+
+    fn = agent_fn or (lambda aid, obs: _rule_based_action(obs))
+    done_agents: set = set()
+    max_steps = env_cfg.max_steps * n  # upper bound on total interactions
+    total_steps = 0
+
+    while len(done_agents) < n and total_steps < max_steps:
+        for agent_id in range(n):
+            if agent_id in done_agents:
+                continue
+            obs = observations[agent_id]
+            action_id = fn(agent_id, obs)
+            action = MultiAgentAction(action_id=action_id, agent_id=agent_id)
+            new_obs = env.step(agent_id, action)
+            observations[agent_id] = new_obs
+            trajectories[agent_id].append({
+                "prices": [
+                    new_obs.market_price_crop_1,
+                    new_obs.market_price_crop_2,
+                    new_obs.market_price_crop_3,
+                ]
+            })
+            if verbose:
+                print(f"[A{agent_id} s{new_obs.current_step}] {new_obs.message[:80]}")
+            if new_obs.done:
+                done_agents.add(agent_id)
+        total_steps += 1
+
+    return env.compute_result(trajectories)
