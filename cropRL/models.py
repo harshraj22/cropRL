@@ -63,6 +63,9 @@ class CroprlObservation(Observation):
     market_price_crop_1: float = Field(description="Spot price for Corn")
     market_price_crop_2: float = Field(description="Spot price for Wheat")
     market_price_crop_3: float = Field(description="Spot price for Chickpea")
+    market_price_crop_4: float = Field(description="Spot price for Matcha (Hype Crop)")
+    market_price_crop_5: float = Field(description="Spot price for Quinoa (Hype Crop)")
+    market_price_crop_6: float = Field(description="Spot price for Turmeric (Hype Crop)")
 
     # ── Costs ───────────────────────────────────────────────────
     cost_seed_1: float = Field(description="Cost to plant Corn")

@@ -295,7 +295,7 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
 
     try:
         while len(done_agents) < n and total_steps < max_steps:
-            for agent_id in range(n):
+            for agent_id in env.get_turn_order():
                 # Always fetch fresh observation — no caching needed
                 obs = env.get_obs(agent_id)
 

@@ -27,6 +27,7 @@ class CroprlEnv(EnvClient[CroprlAction, CroprlObservation, CroprlState]):
                 crop_age_months=obs_data.get("crop_age_months", 0),
                 expected_yield_potential=obs_data.get("expected_yield_potential", 0.0),
                 soil_nitrogen=obs_data.get("soil_nitrogen", 0.0),
+                current_water_level=obs_data.get("current_water_level", 0.0),
                 cash_balance=obs_data.get("cash_balance", 0.0),
                 current_debt=obs_data.get("current_debt", 0.0),
                 current_interest_rate=obs_data.get("current_interest_rate", 0.0),

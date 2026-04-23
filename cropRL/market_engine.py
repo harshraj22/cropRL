@@ -62,7 +62,7 @@ class _HypeCrop:
         self.months_in_phase: int = 0
         self._peak_duration: int = self.PEAK_MIN_MONTHS  # set on PEAK entry
 
-    def tick(self, trigger_prob: float, sold_volume: float, market_capacity: float) -> None:
+    def tick(self, trigger_prob: float, collapse_threshold: float, sold_volume: float, market_capacity: float) -> None:
         """Advance the hype cycle by one month."""
         self.months_in_phase += 1
 
@@ -81,7 +81,7 @@ class _HypeCrop:
             # Early collapse trigger: over-supply
             over_supplied = (
                 market_capacity > 0
-                and sold_volume > market_capacity * 0.6
+                and sold_volume > market_capacity * collapse_threshold
             )
             # Timeout trigger: peak duration exceeded
             timed_out = self.months_in_phase >= self._peak_duration
@@ -180,6 +180,7 @@ class HypeEngine:
             cap = self._cfg.market_capacity.get(ct_int, 1.0)
             crop.tick(
                 trigger_prob=self._cfg.hype_trigger_prob,
+                collapse_threshold=self._cfg.hype_collapse_supply_threshold,
                 sold_volume=vol,
                 market_capacity=cap,
             )
@@ -332,9 +333,9 @@ class MarketEngine:
             rev = order.volume * price
             revenues[order.agent_id] = revenues.get(order.agent_id, 0.0) + rev
 
-        # Snapshot last_month_realised_prices (Corn, Wheat, Chickpea only)
+        # Snapshot last_month_realised_prices (All 6 crops)
         self.last_month_realised_prices = tuple(
-            self.realised_prices[i] for i in range(1, 4)
+            self.realised_prices[i] for i in range(1, self._env_cfg.num_crop_types)
         )
 
         # Tick hype engine (uses actual sold volumes)

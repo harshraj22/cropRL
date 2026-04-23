@@ -245,9 +245,12 @@ class MultiAgentCroprlEnvironment(
                 ))
 
         elif action_id == ActionType.HARVEST_STORE:
-            penalty, msg = farm.do_harvest_store()
+            penalty, msg, old_crop_type, old_volume = farm.do_harvest_store()
             messages.append(msg)
             if penalty == 0.0:
+                if old_volume > 0 and self._market is not None:
+                    self._market.queue_sell(agent_id, old_crop_type, old_volume, is_inventory=True)
+                
                 self._ledger.record(LedgerEvent(
                     agent_id=agent_id, month=self._current_month(), slot=slot,
                     event_type=LedgerEventType.HARVESTED_STORED,
@@ -538,6 +541,9 @@ class MultiAgentCroprlEnvironment(
             market_price_crop_1=s["prices"][0],
             market_price_crop_2=s["prices"][1],
             market_price_crop_3=s["prices"][2],
+            market_price_crop_4=s["prices"][3] if len(s["prices"]) > 3 else 0.0,
+            market_price_crop_5=s["prices"][4] if len(s["prices"]) > 4 else 0.0,
+            market_price_crop_6=s["prices"][5] if len(s["prices"]) > 5 else 0.0,
             cost_seed_1=s["inflated_seed_costs"][1],
             cost_seed_2=s["inflated_seed_costs"][2],
             cost_seed_3=s["inflated_seed_costs"][3],
@@ -615,6 +621,12 @@ class MultiAgentCroprlEnvironment(
 
     def _current_month(self) -> int:
         return self._farms[0].month if self._farms else 1
+
+    def get_turn_order(self) -> List[int]:
+        """Return the current month's agent turn order, accounting for the rotating offset."""
+        n = self._ma_cfg.num_agents
+        offset = self._time_ctrl._first_agent_offset
+        return [(i + offset) % n for i in range(n)]
 
     def _check_termination(self, farm: FarmState) -> bool:
         s = farm.s

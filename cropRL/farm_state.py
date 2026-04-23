@@ -219,13 +219,13 @@ class FarmState:
             f"{s['soil_nitrogen']:.2f}. Cost: ₹{cost:,.0f}."
         )
 
-    def do_harvest_store(self) -> Tuple[float, str]:
+    def do_harvest_store(self) -> Tuple[float, str, int, float]:
         s = self._s
         cfg = self.config
         if s["active_crop_type"] == CropType.FALLOW or s["crop_age_months"] < 1:
             return cfg.invalid_action_penalty, (
                 "INVALID: Nothing to harvest — no crop planted or crop too young."
-            )
+            ), CropType.FALLOW, 0.0
 
         crop_type = s["active_crop_type"]
         harvested = calculate_yield(
@@ -234,13 +234,15 @@ class FarmState:
         )
 
         parts: list[str] = []
+        old_type = CropType.FALLOW
+        old_volume = 0.0
+
         if s["stored_amount"] > 0:
             old_type = s["stored_crop_type"]
-            old_revenue = s["stored_amount"] * s["prices"][old_type - 1]
-            s["cash"] += old_revenue
+            old_volume = s["stored_amount"]
             parts.append(
-                f"Auto-sold {s['stored_amount']:.1f} tons of "
-                f"{cfg.crop_names[old_type]} for ₹{old_revenue:,.0f}."
+                f"Displaced {old_volume:.1f} tons of {cfg.crop_names[old_type]} "
+                "to market queue."
             )
 
         s["stored_crop_type"] = crop_type
@@ -253,7 +255,7 @@ class FarmState:
             f"Harvested {harvested:.1f} tons of {cfg.crop_names[crop_type]} "
             f"and stored it."
         )
-        return 0.0, " ".join(parts)
+        return 0.0, " ".join(parts), old_type, old_volume
 
     def do_harvest_sell_queued(self) -> Tuple[float, str, int, float]:
         """

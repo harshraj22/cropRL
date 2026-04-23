@@ -249,12 +249,12 @@ def grader(
     total_oracle_profit = 0.0
 
     for step_data in trajectory:
-        prices = step_data.get("prices", [1200.0, 800.0, 500.0])
+        prices = step_data.get("prices", list(cfg.base_market_prices[1:]))
 
         # Monthly amortized profit: (price × max_yield − seed_cost) / growth_months
-        corn_prof = ((prices[0] * 8.0) - 800.0) / 4.0
-        wheat_prof = ((prices[1] * 5.0) - 500.0) / 3.0
-        chickpea_prof = ((prices[2] * 3.0) - 200.0) / 3.0
+        corn_prof = ((prices[0] * cfg.base_yield_tons[1]) - cfg.seed_costs[1]) / float(cfg.growth_months[1])
+        wheat_prof = ((prices[1] * cfg.base_yield_tons[2]) - cfg.seed_costs[2]) / float(cfg.growth_months[2])
+        chickpea_prof = ((prices[2] * cfg.base_yield_tons[3]) - cfg.seed_costs[3]) / float(cfg.growth_months[3])
 
         total_oracle_profit += max(0.0, corn_prof, wheat_prof, chickpea_prof)
 
@@ -386,7 +386,7 @@ def run_multi_agent_episode(
     total_steps = 0
 
     while len(done_agents) < n and total_steps < max_steps:
-        for agent_id in range(n):
+        for agent_id in env.get_turn_order():
             if agent_id in done_agents:
                 continue
             obs = env.get_obs(agent_id)
