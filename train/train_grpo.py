@@ -2,14 +2,15 @@ import os
 import re
 import sys
 import argparse
+import random
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from pathlib import Path
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
-from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
 
 import wandb
 
@@ -20,28 +21,25 @@ from cropRL.tasks import create_env_for_task
 from cropRL.models import MultiAgentAction
 from cropRL.inference import parse_action, get_agent_system_prompt
 
-def get_action_logprobs(model, input_ids, gen_seq_len):
+def get_action_logprobs(model, input_ids, gen_seqs, gen_mask):
     """
-    Given full input_ids (prompt + generated_sequence), compute the log probabilities
-    of the generated sequence tokens.
+    Given full input_ids, generated sequences, and their attention mask,
+    compute the sum of log probabilities for the non-padded generated tokens.
     """
     outputs = model(input_ids)
-    # logits shape: (batch_size, seq_len, vocab_size)
-    # We want the logits corresponding to the generated sequence.
-    # The generated sequence starts at index: seq_len - gen_seq_len
-    # For a token at index i, its logit is at index i-1.
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
     
-    # Extract only the generated part
+    gen_seq_len = gen_seqs.shape[1]
     gen_logits = logits[:, -gen_seq_len:, :]
     gen_labels = labels[:, -gen_seq_len:]
     
     logprobs = F.log_softmax(gen_logits, dim=-1)
     action_logprobs = logprobs.gather(dim=-1, index=gen_labels.unsqueeze(-1)).squeeze(-1)
     
-    # Sum logprobs over the generated sequence
-    return action_logprobs.sum(dim=-1)
+    # Mask out padding tokens
+    masked_logprobs = action_logprobs * gen_mask
+    return masked_logprobs.sum(dim=-1)
 
 def train(args):
     # Initialize WandB
@@ -74,7 +72,6 @@ def train(args):
         task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, peft_config)
-    model.train()
     print("LoRA applied successfully. Trainable parameters:")
     model.print_trainable_parameters()
     
@@ -85,17 +82,22 @@ def train(args):
     for iteration in range(1, args.num_iterations + 1):
         print(f"\n--- Iteration {iteration}/{args.num_iterations} ---")
         
-        # 1. Rollout Phase (Group size G)
+        # --- 1. Rollout Phase ---
+        model.eval() # Prevent dropout noise during rollout
+        
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
-        observations = [env.reset() for env in envs]
-        # In single agent task, env.reset() returns a dict or list? Wait. 
-        # Actually `env.reset()` returns dict of observations in old architecture, 
-        # but in new architecture, it just resets. We must call get_obs(0).
+        
+        # Enforce single agent to avoid non-advancing months with static rule agents
+        assert envs[0]._ma_cfg.num_agents == 1, "Training script only supports single-agent tasks (e.g., 'easy')."
+        
+        for env in envs:
+            env.reset()
         observations = [env.get_obs(0) for env in envs]
         
-        active_envs = list(range(args.group_size))
+        # Get initial net worths for reward shaping
+        prev_net_worths = [env._inner.farms[0]._compute_net_worth() for env in envs]
         
-        # Store rollout data: list of lists
+        active_envs = list(range(args.group_size))
         trajectories = [[] for _ in range(args.group_size)]
         
         step_count = 0
@@ -105,14 +107,12 @@ def train(args):
                 prompts = []
                 for i in active_envs:
                     obs = observations[i]
-                    # Format prompt
                     user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
                     prompt = get_agent_system_prompt(0, 1) + "\n\n" + user_msg + "\nAction:"
                     prompts.append(prompt)
                 
                 inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
                 
-                # Generate actions
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=args.max_new_tokens,
@@ -122,14 +122,13 @@ def train(args):
                     eos_token_id=tokenizer.eos_token_id,
                 )
                 
-                # Process outputs
                 gen_seqs = outputs[:, inputs.input_ids.shape[1]:]
                 action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
                 
-                # Calculate old logprobs for PPO/GRPO reference
+                # Mask out right-padding in generation
+                gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
                 full_seqs = outputs
-                gen_seq_len = gen_seqs.shape[1]
-                old_logprobs = get_action_logprobs(model, full_seqs, gen_seq_len)
+                old_logprobs = get_action_logprobs(model, full_seqs, gen_seqs, gen_mask)
                 
                 new_active_envs = []
                 for idx, env_idx in enumerate(active_envs):
@@ -139,26 +138,28 @@ def train(args):
                     action_obj = MultiAgentAction(action_id=action_id, agent_id=0, forum_message=forum_msg)
                     next_obs = envs[env_idx].step(action_obj)
                     
-                    # Reward shaping: Change in net worth
-                    reward = next_obs.reward or 0.0
+                    # Reward shaping: Change in exact net worth (including crop/land values)
+                    current_net_worth = envs[env_idx]._inner.farms[0]._compute_net_worth()
+                    reward = current_net_worth - prev_net_worths[env_idx]
+                    prev_net_worths[env_idx] = current_net_worth
                     
                     trajectories[env_idx].append({
                         "input_ids": full_seqs[idx].cpu(),
-                        "gen_seq_len": gen_seq_len,
+                        "gen_seqs": gen_seqs[idx].cpu(),
+                        "gen_mask": gen_mask[idx].cpu(),
                         "old_logprob": old_logprobs[idx].item(),
                         "reward": reward,
-                        "net_worth": next_obs.cash_balance + next_obs.current_debt, # We'll track final later
+                        "net_worth": current_net_worth,
                         "action_id": action_id
                     })
                     
                     observations[env_idx] = next_obs
-                    
                     if not next_obs.done:
                         new_active_envs.append(env_idx)
                         
                 active_envs = new_active_envs
         
-        # 2. Compute Advantages (GRPO Normalization)
+        # --- 2. Compute Advantages (GRPO) ---
         episode_returns = np.array([sum(step["reward"] for step in traj) for traj in trajectories])
         mean_return = episode_returns.mean()
         std_return = episode_returns.std() + 1e-8
@@ -167,50 +168,72 @@ def train(args):
         print(f"Returns: {episode_returns.round(2)}")
         print(f"Mean Return: {mean_return:.2f} | Std: {std_return:.2f}")
         
-        # 3. Optimization Phase
-        model.train()
+        # --- 3. Optimization Phase ---
+        model.train() # Enable dropout/training mode
+        
+        # Flatten dataset for randomized mini-batching
+        dataset = []
+        for env_idx, traj in enumerate(trajectories):
+            A_i = advantages[env_idx]
+            for step in traj:
+                dataset.append({
+                    "input_ids": step["input_ids"],
+                    "gen_seqs": step["gen_seqs"],
+                    "gen_mask": step["gen_mask"],
+                    "old_logprob": step["old_logprob"],
+                    "A_i": A_i
+                })
+        
+        # Shuffle dataset to break temporal correlations
+        random.shuffle(dataset)
+        
         total_loss = 0
         total_kl = 0
         optim_steps = 0
         
-        # For each trajectory and step, compute GRPO loss
-        for env_idx, traj in enumerate(trajectories):
-            A_i = advantages[env_idx]
+        optimizer.zero_grad()
+        
+        # Iterate over steps, accumulating gradients to simulate mini-batches
+        for step_idx, step in enumerate(dataset):
+            full_seq = step["input_ids"].unsqueeze(0).to(device)
+            gen_seqs = step["gen_seqs"].unsqueeze(0).to(device)
+            gen_mask = step["gen_mask"].unsqueeze(0).to(device)
+            old_logprob = step["old_logprob"]
+            A_i = step["A_i"]
             
-            for step in traj:
-                full_seq = step["input_ids"].unsqueeze(0).to(device)
-                gen_seq_len = step["gen_seq_len"]
-                old_logprob = step["old_logprob"]
-                
-                # Forward pass current model
-                current_logprobs = get_action_logprobs(model, full_seq, gen_seq_len).squeeze(0)
-                
-                # Forward pass reference model (LoRA disabled)
-                with torch.no_grad():
-                    with model.disable_adapter():
-                        ref_logprobs = get_action_logprobs(model, full_seq, gen_seq_len).squeeze(0)
-                
-                # PPO Ratio
-                ratio = torch.exp(current_logprobs - old_logprob)
-                
-                # KL Divergence Penalty (approx)
-                kl_div = torch.exp(ref_logprobs - current_logprobs) - (ref_logprobs - current_logprobs) - 1
-                
-                # Clipped Surrogate Objective
-                surr1 = ratio * A_i
-                surr2 = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * A_i
-                policy_loss = -torch.min(surr1, surr2)
-                
-                # Total Loss
-                loss = policy_loss + args.beta * kl_div
-                
-                optimizer.zero_grad()
-                loss.backward()
+            # Forward pass current model
+            current_logprobs = get_action_logprobs(model, full_seq, gen_seqs, gen_mask).squeeze(0)
+            
+            # Forward pass reference model (LoRA disabled)
+            with torch.no_grad():
+                with model.disable_adapter():
+                    ref_logprobs = get_action_logprobs(model, full_seq, gen_seqs, gen_mask).squeeze(0)
+            
+            # PPO Ratio
+            ratio = torch.exp(current_logprobs - old_logprob)
+            
+            # KL Divergence Penalty
+            kl_div = torch.exp(ref_logprobs - current_logprobs) - (ref_logprobs - current_logprobs) - 1
+            
+            # Clipped Surrogate Objective
+            surr1 = ratio * A_i
+            surr2 = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * A_i
+            policy_loss = -torch.min(surr1, surr2)
+            
+            loss = policy_loss + args.beta * kl_div
+            
+            # Gradient accumulation
+            loss = loss / args.gradient_accumulation_steps
+            loss.backward()
+            
+            total_loss += loss.item() * args.gradient_accumulation_steps
+            total_kl += kl_div.item()
+            
+            # Step optimizer periodically
+            if (step_idx + 1) % args.gradient_accumulation_steps == 0 or (step_idx + 1) == len(dataset):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
-                
-                total_loss += loss.item()
-                total_kl += kl_div.item()
+                optimizer.zero_grad()
                 optim_steps += 1
                 
         # Logging
@@ -244,6 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")
     parser.add_argument("--group_size", type=int, default=8, help="Number of trajectories to collect per iteration (G)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Batch size equivalent via grad accumulation")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for LoRA")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
