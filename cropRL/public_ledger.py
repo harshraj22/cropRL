@@ -134,6 +134,7 @@ class Forum:
                 f"({self._messages_per_month} per month)."
             )
 
+        text = text[:150]
         msg = ForumMessage(
             agent_id=agent_id,
             month=month,
