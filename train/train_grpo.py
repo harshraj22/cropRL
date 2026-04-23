@@ -110,7 +110,6 @@ def train(args):
             while active_envs:
                 step_count += 1
                 # Use the rotating turn order from the first active env (valid proxy for batch)
-                turn_order = envs[active_envs[0]].get_turn_order()
                 for agent_slot in range(n_agents):
                     prompts = []
                     valid_env_indices = []
