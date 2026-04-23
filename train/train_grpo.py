@@ -99,7 +99,7 @@ def train(args):
             env.reset()
         
         # Get initial net worths for reward shaping (per env, per agent)
-        prev_net_worths = [[env._farms[a]._compute_net_worth() for a in range(n_agents)] for env in envs]
+        prev_net_worths = [[env._farms[a].compute_net_worth() for a in range(n_agents)] for env in envs]
         
         active_envs = list(range(args.group_size))
         done_agents = {i: set() for i in range(args.group_size)}
@@ -181,7 +181,7 @@ def train(args):
                         next_obs = envs[env_idx].step(action_obj)
                         
                         # Reward shaping: Change in exact net worth (including crop/land values)
-                        current_net_worth = envs[env_idx]._farms[agent_id]._compute_net_worth()
+                        current_net_worth = envs[env_idx]._farms[agent_id].compute_net_worth()
                         reward = current_net_worth - prev_net_worths[env_idx][agent_id]
                         prev_net_worths[env_idx][agent_id] = current_net_worth
                         
