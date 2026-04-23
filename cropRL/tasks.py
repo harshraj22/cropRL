@@ -10,8 +10,8 @@ Multi-agent task variants are also provided:
   hard_2agent, hard_4agent, hard_8agent
 """
 
-from cropRL import CroprlAction
 from __future__ import annotations
+from cropRL import CroprlAction
 
 from typing import Optional
 
