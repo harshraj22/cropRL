@@ -10,6 +10,7 @@ Multi-agent task variants are also provided:
   hard_2agent, hard_4agent, hard_8agent
 """
 
+from cropRL import CroprlAction
 from __future__ import annotations
 
 from typing import Optional
@@ -389,6 +390,7 @@ def run_multi_agent_episode(
     while len(done_agents) < n and total_steps < max_steps:
         for agent_id in env.get_turn_order():
             if agent_id in done_agents:
+                env.step(CroprlAction(action_id=0, agent_id=agent_id))
                 continue
             obs = env.get_obs(agent_id)
             if obs.done:
