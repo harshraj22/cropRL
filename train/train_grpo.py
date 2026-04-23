@@ -104,12 +104,20 @@ def train(args):
                 step_count += 1
                 # Use the rotating turn order from the first active env (valid proxy for batch)
                 turn_order = envs[active_envs[0]].get_turn_order()
-                for agent_id in turn_order:
+                for agent_slot in range(n_agents):
                     prompts = []
                     valid_env_indices = []
+                    agent_ids_for_batch = []
                     
                     # Fetch fresh observations for this agent across active environments
                     for env_idx in active_envs:
+                        turn_order = envs[env_idx].get_turn_order()
+                        agent_id = turn_order[agent_slot]
+                        if agent_id in done_agents[env_idx]:
+                            action_obj = MultiAgentAction(action_id=0, agent_id=agent_id, forum_message=None)
+                            envs[env_idx].step(action_obj)
+                            continue
+
                         obs = envs[env_idx].get_obs(agent_id)
                         
                         if obs.done:
@@ -120,9 +128,20 @@ def train(args):
                             continue
                             
                         user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
-                        prompt = get_agent_system_prompt(agent_id, n_agents) + "\n\n" + user_msg + "\nAction:"
+
+                        messages = [
+                            {"role": "system", "content": get_agent_system_prompt(agent_id, n_agents)},
+                            {"role": "user", "content": user_msg}
+                        ]
+                        prompt = tokenizer.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False
+                        )
+
                         prompts.append(prompt)
                         valid_env_indices.append(env_idx)
+                        agent_ids_for_batch.append(agent_id)
                     
                     if not prompts:
                         continue
@@ -269,8 +288,8 @@ def train(args):
             "std_return": std_return,
             "loss": avg_loss,
             "kl_divergence": avg_kl,
-            "max_return": episode_returns.max(),
-            "min_return": episode_returns.min(),
+            "max_return": all_returns.max(),
+            "min_return": all_returns.min(),
         })
         
         # Save Checkpoint
