@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from pathlib import Path
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from peft import LoraConfig, get_peft_model
 
 import wandb
@@ -21,12 +21,12 @@ from cropRL.tasks import create_env_for_task
 from cropRL.models import MultiAgentAction
 from cropRL.inference import parse_action, get_agent_system_prompt
 
-def get_action_logprobs(model, input_ids, gen_seqs, gen_mask):
+def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     """
-    Given full input_ids, generated sequences, and their attention mask,
+    Given full input_ids, their attention mask, generated sequences, and their mask,
     compute the sum of log probabilities for the non-padded generated tokens.
     """
-    outputs = model(input_ids)
+    outputs = model(input_ids, attention_mask=attention_mask)
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
     
@@ -77,9 +77,16 @@ def train(args):
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_iterations,
+        num_training_steps=args.num_iterations
+    )
+    
     os.makedirs(args.output_dir, exist_ok=True)
     
-    for iteration in range(1, args.num_iterations + 1):
+    for iteration in tqdm(range(1, args.num_iterations + 1), desc="Training Iterations"):
         print(f"\n--- Iteration {iteration}/{args.num_iterations} ---")
         
         # --- 1. Rollout Phase ---
@@ -163,7 +170,8 @@ def train(args):
                     # Mask out right-padding in generation
                     gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
                     full_seqs = outputs
-                    old_logprobs = get_action_logprobs(model, full_seqs, gen_seqs, gen_mask)
+                    full_attention_mask = (full_seqs != tokenizer.pad_token_id).long()
+                    old_logprobs = get_action_logprobs(model, full_seqs, full_attention_mask, gen_seqs, gen_mask)
                     
                     for idx, env_idx in enumerate(valid_env_indices):
                         agent_id = agent_ids_for_batch[idx]
@@ -180,6 +188,7 @@ def train(args):
                         
                         trajectories[env_idx][agent_id].append({
                             "input_ids": full_seqs[idx].cpu(),
+                            "attention_mask": full_attention_mask[idx].cpu(),
                             "gen_seqs": gen_seqs[idx].cpu(),
                             "gen_mask": gen_mask[idx].cpu(),
                             "old_logprob": old_logprobs[idx].item(),
@@ -220,6 +229,7 @@ def train(args):
                 for step in trajectories[env_idx][agent_id]:
                     dataset.append({
                         "input_ids": step["input_ids"],
+                        "attention_mask": step["attention_mask"],
                         "gen_seqs": step["gen_seqs"],
                         "gen_mask": step["gen_mask"],
                         "old_logprob": step["old_logprob"],
@@ -239,18 +249,19 @@ def train(args):
         # Iterate over steps, accumulating gradients to simulate mini-batches
         for step_idx, step in enumerate(dataset):
             full_seq = step["input_ids"].unsqueeze(0).to(device)
+            full_attention_mask = step["attention_mask"].unsqueeze(0).to(device)
             gen_seqs = step["gen_seqs"].unsqueeze(0).to(device)
             gen_mask = step["gen_mask"].unsqueeze(0).to(device)
             old_logprob = step["old_logprob"]
             A_i = step["A_i"]
             
             # Forward pass current model
-            current_logprobs = get_action_logprobs(model, full_seq, gen_seqs, gen_mask).squeeze(0)
+            current_logprobs = get_action_logprobs(model, full_seq, full_attention_mask, gen_seqs, gen_mask).squeeze(0)
             
             # Forward pass reference model (LoRA disabled)
             with torch.no_grad():
                 with model.disable_adapter():
-                    ref_logprobs = get_action_logprobs(model, full_seq, gen_seqs, gen_mask).squeeze(0)
+                    ref_logprobs = get_action_logprobs(model, full_seq, full_attention_mask, gen_seqs, gen_mask).squeeze(0)
             
             # PPO Ratio
             ratio = torch.exp(current_logprobs - old_logprob)
@@ -291,7 +302,11 @@ def train(args):
             "kl_divergence": avg_kl,
             "max_return": all_returns.max(),
             "min_return": all_returns.min(),
+            "learning_rate": lr_scheduler.get_last_lr()[0],
         })
+        
+        # Step the learning rate scheduler at the end of each iteration
+        lr_scheduler.step()
         
         # Save Checkpoint
         if iteration % args.save_every == 0:
@@ -312,6 +327,8 @@ if __name__ == "__main__":
     parser.add_argument("--group_size", type=int, default=8, help="Number of trajectories to collect per iteration (G)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Batch size equivalent via grad accumulation")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for LoRA")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="Scheduler type (cosine, linear)")
+    parser.add_argument("--warmup_iterations", type=int, default=5, help="Number of warmup iterations")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--clip_eps", type=float, default=0.2, help="PPO clipping parameter")
