@@ -350,7 +350,7 @@ class FarmState:
     # Monthly dynamics
     # ──────────────────────────────────────────────────────────────
 
-    def advance_month(self) -> list[str]:
+    def advance_month(self, skip_price_generation=False) -> list[str]:
         """Advance all monthly dynamics. Returns list of event messages."""
         s = self._s
         cfg = self.config
@@ -422,11 +422,12 @@ class FarmState:
         # New prices and weather
         s["expected_rainfall"] = generate_rainfall(s["month"], cfg, self._rng)
         prev_prices = s["prices"]
-        s["prices"] = generate_market_prices(
-            s["month"], cfg, self._rng,
-            prev_prices=prev_prices,
-            effective_base_prices=tuple(s["inflated_base_market_prices"]),
-        )
+        if not skip_price_generation:
+            s["prices"] = generate_market_prices(
+                s["month"], cfg, self._rng,
+                prev_prices=prev_prices,
+                effective_base_prices=tuple(s["inflated_base_market_prices"]),
+            )
 
         # Interest rate
         optimal_water = (
