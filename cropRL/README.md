@@ -80,7 +80,7 @@ Each month, the agent picks one of 15 actions:
 
 | ID | Action | Effect |
 |----|--------|--------|
-| 0 | Wait / End Turn | End your turn for this month |
+| 0 | Wait / No-Op | Do nothing but consume 1 action slot |
 | 1–3 | Plant Corn / Wheat / Chickpea | Spend seed cost, occupy land |
 | 4 | Irrigate | Spend ₹300, dynamically boost soil water level depending on the crop (configurable via config.py) |
 | 5 | Fertilize | Spend ₹400, boost soil nitrogen by +0.15 |

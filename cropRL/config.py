@@ -169,7 +169,7 @@ class EnvConfig:
     num_actions: int = 15
 
     action_names: Tuple[str, ...] = (
-        "End Turn / Wait",
+        "Wait / No-Op",
         "Plant Corn (Heavy Feeder)",
         "Plant Wheat (Medium Feeder)",
         "Plant Chickpea (Legume)",

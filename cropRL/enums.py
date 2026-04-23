@@ -33,9 +33,9 @@ class CropType(IntEnum):
 class ActionType(IntEnum):
     """All discrete actions the agent can take."""
 
-    # In multi-agent mode, action 0 is END_TURN (replaces WAIT semantics)
+    # In multi-agent mode, action 0 is WAIT (replaces END_TURN semantics)
     WAIT = 0
-    END_TURN = 0   # alias for WAIT in multi-agent contexts
+    NO_OP = 0   # alias for WAIT in multi-agent contexts
     PLANT_CORN = 1
     PLANT_WHEAT = 2
     PLANT_CHICKPEA = 3
@@ -72,7 +72,7 @@ class LedgerEventType(str, Enum):
     SOLD_INVENTORY   = "sell_inventory"
     LOAN_TAKEN       = "loan_taken"
     LOAN_REPAID      = "loan_repaid"
-    END_TURN         = "end_turn"
+    WAIT             = "wait"
     FORUM_MESSAGE    = "forum_message"
 
 

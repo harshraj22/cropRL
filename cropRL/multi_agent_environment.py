@@ -48,7 +48,7 @@ class MultiAgentCroprlEnvironment(
     N agents each own a private ``FarmState`` (their farm).
     A shared ``TimeController`` synchronises the calendar month using a
     slot-based budget: the month advances only when every agent has
-    either used all slots or called End Turn (action 0).
+    used all slots.
 
     Sell actions (HARVEST_SELL, SELL_INVENTORY) are **deferred**: they are
     queued in the ``MarketEngine`` and cleared at month-end, so collective
@@ -155,19 +155,19 @@ class MultiAgentCroprlEnvironment(
         """
         Execute one step for the agent identified by ``action.agent_id``.
 
-        The underlying month advances only when all agents have signalled
-        End Turn (action 0) or exhausted their slot budgets.
+        The underlying month advances only when all agents have exhausted
+        their slot budgets.
         """
         agent_id = action.agent_id
         n = self._ma_cfg.num_agents
         if agent_id < 0 or agent_id >= n:
             raise ValueError(f"Invalid agent_id {agent_id}; expected 0..{n-1}")
 
-        # Guard: already ended turn
-        if self._time_ctrl.is_turn_done(agent_id):
+        # Guard: out of slots
+        if self._time_ctrl.slots_remaining(agent_id) <= 0:
             return self._build_ma_obs(
                 agent_id,
-                "You already ended your turn this month. Waiting for others.",
+                "You have exhausted your action slots for this month. Waiting for others.",
                 self._env_cfg.invalid_action_penalty,
                 False,
             )
@@ -178,36 +178,23 @@ class MultiAgentCroprlEnvironment(
         penalty = 0.0
         messages: List[str] = []
 
-        # ── Handle End Turn (action 0) ────────────────────────────
+        # ── Handle Wait / No-Op (action 0) ────────────────────────────
         if action_id == ActionType.WAIT:
             self._ledger.record(LedgerEvent(
                 agent_id=agent_id,
                 month=self._current_month(),
                 slot=self._time_ctrl.current_slot_for(agent_id),
-                event_type=LedgerEventType.END_TURN,
+                event_type=LedgerEventType.WAIT,
             ))
-            all_done = self._time_ctrl.submit_turn_end(agent_id)
-            messages.append("Turn ended for this month.")
-
-            if all_done:
-                month_msgs = self._do_advance_month()
-                messages.extend(month_msgs)
-
-            done = self._check_termination(farm)
-            return self._build_ma_obs(agent_id, " | ".join(messages), penalty, done)
-
-        # ── Guard: no slots remaining ─────────────────────────────
-        if self._time_ctrl.slots_remaining(agent_id) <= 0:
-            all_done = self._time_ctrl.submit_turn_end(agent_id)
-            messages.append("Action budget exhausted — turn auto-ended.")
-            if all_done:
-                messages.extend(self._do_advance_month())
-            return self._build_ma_obs(agent_id, " | ".join(messages), penalty, False)
+            messages.append("You waited / took no action this slot.")
 
         # ── Execute action ────────────────────────────────────────
         slot = self._time_ctrl.current_slot_for(agent_id)
 
-        if action_id == ActionType.POST_MESSAGE:
+        if action_id == ActionType.WAIT:
+            pass  # Already handled above
+        
+        elif action_id == ActionType.POST_MESSAGE:
             penalty, msg = self._do_post_message(agent_id, slot, action)
             messages.append(msg)
 
@@ -318,8 +305,8 @@ class MultiAgentCroprlEnvironment(
         self._time_ctrl.consume_slot(agent_id)
         s["step"] += 1
 
-        # ── Auto-end turn if budget just exhausted ────────────────
-        if self._time_ctrl.is_turn_done(agent_id) and self._time_ctrl.all_done():
+        # ── Auto-advance month if all agents exhausted budgets ────────────
+        if self._time_ctrl.all_done():
             adv_msgs = self._do_advance_month()
             messages.extend(adv_msgs)
 
@@ -344,7 +331,8 @@ class MultiAgentCroprlEnvironment(
 
     def get_obs(self, agent_id: int) -> MultiAgentObservation:
         """Get the current observation for a specific agent."""
-        return self._build_ma_obs(agent_id, "", 0.0, False)
+        done = self._check_termination(self._farms[agent_id])
+        return self._build_ma_obs(agent_id, "", 0.0, done)
 
     # ──────────────────────────────────────────────────────────────
     # Grading

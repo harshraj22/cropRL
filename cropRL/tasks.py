@@ -316,7 +316,7 @@ class MultiAgentGrader:
 def _rule_based_action(obs: "MultiAgentObservation") -> int:  # noqa: F821
     """
     Simple deterministic agent used for smoke-testing multi-agent episodes.
-    Priority: harvest if mature → plant if fallow → irrigate → end turn.
+    Priority: harvest if mature → plant if fallow → irrigate → wait.
     """
     from .enums import ActionType, CropType
 
@@ -338,7 +338,7 @@ def _rule_based_action(obs: "MultiAgentObservation") -> int:  # noqa: F821
             and obs.cash_balance >= obs.cost_irrigate):
         return ActionType.IRRIGATE
 
-    return ActionType.END_TURN
+    return ActionType.WAIT
 
 
 # ── Multi-agent episode runner ──────────────────────────────────────────────

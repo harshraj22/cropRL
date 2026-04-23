@@ -39,7 +39,7 @@ You may be competing or cooperating with other AI farmers in the village.
 OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by the end of 60 months.
 
 ACTIONS (reply with ONLY the action number, or if action 11, reply with: 11 <your message>):
-0: Wait / End Turn — Complete your actions for this month.
+0: Wait / No-Op — Do nothing but consume 1 action slot.
 1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. 
 2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
 3: Plant Chickpea — Low cost, lower yield, RESTORES soil nitrogen. 
@@ -56,7 +56,7 @@ ACTIONS (reply with ONLY the action number, or if action 11, reply with: 11 <you
 14: Plant Turmeric (Hype Crop) — Moderate hype premium.
 
 KEY RULES:
-- Action 0 (Wait) ends your turn for the month. The month advances ONLY when all agents end turn or expend action slots.
+- Action 0 (Wait) consumes an action slot and does nothing else. The month advances ONLY when all agents expend all configured action slots.
 - Actions cost 1 action slot each month.
 - Crops queued to sell are cleared at the END of the month. High supply drops the market clearing price for everyone.
 - Hype crops follow unpredictable cycles. Monitor Social Media Trends.
@@ -296,17 +296,17 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
     try:
         while len(done_agents) < n and total_steps < max_steps:
             for agent_id in range(n):
-                if agent_id in done_agents:
-                    continue
-
                 # Always fetch fresh observation — no caching needed
                 obs = env.get_obs(agent_id)
 
                 if obs.done:
                     done_agents.add(agent_id)
-                    continue
-
-                action_id, forum_message = get_model_action(client, obs, histories[agent_id], agent_id=agent_id, num_agents=n)
+                    # Dead/done agents automatically wait out their slots so they don't block TimeController
+                    action_id = 0
+                    forum_message = None
+                else:
+                    action_id, forum_message = get_model_action(client, obs, histories[agent_id], agent_id=agent_id, num_agents=n)
+                
                 action_name = env._env_cfg.action_names[action_id] if action_id < len(env._env_cfg.action_names) else f"Action {action_id}"
 
                 action = MultiAgentAction(action_id=action_id, agent_id=agent_id, forum_message=forum_message)
@@ -319,6 +319,7 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
 
                 histories[agent_id].append(f"Step {new_obs.current_step}: Selected '{action_name}' -> Reward {reward:+.2f}")
 
+                # Trajectory bookkeeping
                 trajectories[agent_id].append({
                     "step": new_obs.current_step,
                     "action_id": action_id,
@@ -333,8 +334,10 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
                     ]
                 })
 
-                obs_details = new_obs.text_summary if getattr(new_obs, "text_summary", None) else str(new_obs)
-                print(f"\n[OBSERVATION - A{agent_id} Step {new_obs.current_step}]\n{obs_details}\n", flush=True)
+                # Only print observation detail if they actually took a choice (aren't dead yet)
+                if not obs.done:
+                    obs_details = new_obs.text_summary if getattr(new_obs, "text_summary", None) else str(new_obs)
+                    print(f"\n[OBSERVATION - A{agent_id} Step {new_obs.current_step}]\n{obs_details}\n", flush=True)
 
                 if new_obs.done:
                     done_agents.add(agent_id)
