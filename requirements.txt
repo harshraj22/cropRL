@@ -7,3 +7,10 @@ openai>=1.0
 tqdm>=4.60
 pytest>=7.0
 httpx>=0.24
+
+# Training dependencies
+torch>=2.0.0
+transformers>=4.40.0
+peft>=0.10.0
+accelerate>=0.29.0
+wandb>=0.16.0
