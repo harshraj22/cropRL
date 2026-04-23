@@ -106,7 +106,7 @@ def train(args):
         trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
         
         step_count = 0
-        with torch.no_grad():
+        with torch.no_grad(), tqdm(total=60, desc="Rollout Phase", leave=False) as pbar:
             while active_envs:
                 step_count += 1
                 # Use the rotating turn order from the first active env (valid proxy for batch)
@@ -200,6 +200,7 @@ def train(args):
                             
                 # Update active envs list (only keep envs where not all agents are done)
                 active_envs = [i for i in active_envs if len(done_agents[i]) < n_agents]
+                pbar.update(1)
         
         # --- 2. Compute Advantages (GRPO) ---
         # Normalize returns across all agents and all group environments
@@ -246,7 +247,7 @@ def train(args):
         optimizer.zero_grad()
         
         # Iterate over steps, accumulating gradients to simulate mini-batches
-        for step_idx, step in enumerate(dataset):
+        for step_idx, step in tqdm(enumerate(dataset), total=len(dataset), desc="Optimization Phase", leave=False):
             full_seq = step["input_ids"].unsqueeze(0).to(device)
             full_attention_mask = step["attention_mask"].unsqueeze(0).to(device)
             gen_seqs = step["gen_seqs"].unsqueeze(0).to(device)
