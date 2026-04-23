@@ -14,15 +14,15 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 # Ensure the root directory is on the path so cropRL module works anywhere
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import OpenAI
 
-from cropRL.tasks import create_env_for_task, grader
-from cropRL.models import CroprlAction
+from cropRL.tasks import create_env_for_task, create_multi_agent_env_for_task, grader, TASKS
+from cropRL.models import CroprlAction, MultiAgentAction
 from cropRL.enums import ActionType, CropType
 
 # ── Configuration ──────────────────────────────────────────────
@@ -34,24 +34,32 @@ MAX_TOKENS = 10  # Hugely reduced to prevent the model from rambling or thinking
 
 SYSTEM_PROMPT = """\
 You are an expert farm manager AI. You manage a small Indian farm over 60 months.
+You may be competing or cooperating with other AI farmers in the village.
 
 OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by the end of 60 months.
 
 ACTIONS (reply with ONLY the action number):
-0: Wait — End this month and advance to the next. Monthly costs deducted.
+0: Wait / End Turn — Complete your actions for this month.
 1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. 
 2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
 3: Plant Chickpea — Low cost, lower yield, RESTORES soil nitrogen. 
 4: Irrigate — Adds water to field instantly. Critical during dry months.
 5: Fertilize — Boosts soil nitrogen by 0.15 instantly.
 6: Harvest & Store — Harvest crop and store it (auto-sells old storage).
-7: Harvest & Sell — Harvest crop and sell immediately at market price.
-8: Sell Inventory — Sell stored crops at current market price.
+7: Harvest & Sell — Harvest crop and queue sale for month-end clearing.
+8: Sell Inventory — Queue stored crops for month-end sale.
 9: Take Loan — Get cash (only if no active loan). Interest locked at current rate.
 10: Repay Loan — Pay off full debt (must have enough cash).
+11: Post Forum Message — Send a short intent message to other agents.
+12: Plant Matcha (Hype Crop) — High hype premium but saturates fast.
+13: Plant Quinoa (Hype Crop) — Moderate hype premium.
+14: Plant Turmeric (Hype Crop) — Moderate hype premium.
 
 KEY RULES:
-- Only Wait (action 0) advances the calendar month. Other actions are instant.
+- Action 0 (Wait) ends your turn for the month. The month advances ONLY when all agents end turn or expend action slots.
+- Actions cost 1 action slot each month.
+- Crops queued to sell are cleared at the END of the month. High supply drops the market clearing price for everyone.
+- Hype crops follow unpredictable cycles. Monitor Social Media Trends.
 - Can only plant on fallow (empty) land.
 - Can only harvest crops aged >= 1 month. 
 - Storage rots after 6 months. Only one slot.
@@ -66,7 +74,7 @@ KEY RULES:
 CRITICAL INSTRUCTION:
 DO NOT use <think> tags.
 DO NOT output any reasoning, chain-of-thought, or explanation.
-Respond IMMEDIATELY with ONLY a single integer (0-10).
+Respond IMMEDIATELY with ONLY a single integer (0-14).
 """
 
 
@@ -97,16 +105,19 @@ def rule_based_agent(obs) -> int:
     # 2. Plant if land is fallow
     if obs.active_crop_type == CropType.FALLOW:
         # If soil nitrogen is low, plant restorative crop (Chickpea)
-        if obs.soil_nitrogen < 0.4 and obs.cash_balance >= obs.cost_seed_3:
+        if obs.soil_nitrogen < 0.4 and obs.cash_balance >= getattr(obs, "cost_seed_3", 200.0):
             return ActionType.PLANT_CHICKPEA
-        # If we have lots of cash and decent soil, plant high-yield (Corn)
-        elif obs.cash_balance >= obs.cost_seed_1 and obs.soil_nitrogen > 0.5:
+        # If we have lots of cash and decent soil, maybe plant Hype or Corn
+        elif obs.cash_balance >= 1500 and obs.soil_nitrogen > 0.5:
+            # Just default to corn, hype is risky for rules
+            return ActionType.PLANT_CORN
+        elif obs.cash_balance >= getattr(obs, "cost_seed_1", 800.0) and obs.soil_nitrogen > 0.5:
             return ActionType.PLANT_CORN
         # Otherwise plant moderate (Wheat)
-        elif obs.cash_balance >= obs.cost_seed_2:
+        elif obs.cash_balance >= getattr(obs, "cost_seed_2", 500.0):
             return ActionType.PLANT_WHEAT
         # Failsafe if broke
-        elif obs.cash_balance < obs.cost_seed_3 and obs.current_debt == 0:
+        elif obs.cash_balance < getattr(obs, "cost_seed_3", 200.0) and obs.current_debt == 0:
             return ActionType.TAKE_LOAN
         return ActionType.WAIT
 
@@ -119,11 +130,11 @@ def rule_based_agent(obs) -> int:
             return ActionType.HARVEST_SELL
 
         # Fertilize if soil is very low
-        if obs.soil_nitrogen < 0.2 and obs.cash_balance >= obs.cost_fertilize:
+        if obs.soil_nitrogen < 0.2 and obs.cash_balance >= getattr(obs, "cost_fertilize", 300.0):
             return ActionType.FERTILIZE
 
         # Irrigate if water is low
-        if obs.current_water_level < 0.2 and obs.cash_balance >= obs.cost_irrigate:
+        if obs.current_water_level < 0.2 and obs.cash_balance >= getattr(obs, "cost_irrigate", 300.0):
             return ActionType.IRRIGATE
 
     return ActionType.WAIT
@@ -134,12 +145,12 @@ def parse_action(response_text: str, fallback_action: int) -> int:
     cleaned = response_text.strip()
     if cleaned.isdigit():
         val = int(cleaned)
-        if 0 <= val <= 10:
+        if 0 <= val <= 14:
             return val
     matches = re.findall(r"\b(\d{1,2})\b", cleaned)
     for match in matches:
         val = int(match)
-        if 0 <= val <= 10:
+        if 0 <= val <= 14:
             return val
     return fallback_action
 
@@ -168,7 +179,7 @@ def get_model_action(client: OpenAI, obs, history: List[str]) -> int:
         return fallback
 
 
-def run_episode(client: OpenAI, task_id: str):
+def run_single_agent_episode(client: OpenAI, task_id: str):
     # Pass text_mode=True so obs has a .text_summary
     env = create_env_for_task(task_id, text_mode=True)
     obs = env.reset(seed=42)
@@ -193,7 +204,7 @@ def run_episode(client: OpenAI, task_id: str):
                 break
 
             action_id = get_model_action(client, obs, history)
-            action_name = env.config.action_names[action_id]
+            action_name = env.config.action_names[action_id] if action_id < len(env.config.action_names) else f"Action {action_id}"
 
             action = CroprlAction(action_id=action_id)
             obs = env.step(action)
@@ -252,12 +263,97 @@ def run_episode(client: OpenAI, task_id: str):
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
+def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
+    env = create_multi_agent_env_for_task(task_id, text_mode=True)
+    observations = env.reset(seed=42)
+    n = env._ma_cfg.num_agents
+
+    histories: Dict[int, List[str]] = {i: [] for i in range(n)}
+    trajectories: Dict[int, List[dict]] = {i: [] for i in range(n)}
+    done_agents = set()
+
+    max_steps = env._env_cfg.max_steps * n
+    total_steps = 0
+    score = 0.0
+    success = False
+
+    log_start(task=task_id, env="croprl_multi_agent", model=MODEL_NAME)
+
+    try:
+        while len(done_agents) < n and total_steps < max_steps:
+            for agent_id in range(n):
+                if agent_id in done_agents:
+                    continue
+
+                obs = observations[agent_id]
+                
+                if obs.done:
+                    done_agents.add(agent_id)
+                    continue
+
+                action_id = get_model_action(client, obs, histories[agent_id])
+                action_name = env._env_cfg.action_names[action_id] if action_id < len(env._env_cfg.action_names) else f"Action {action_id}"
+                
+                # Setup MultiAgentAction specifically
+                action = MultiAgentAction(action_id=action_id, agent_id=agent_id)
+                new_obs = env.step(agent_id, action)
+
+                reward = new_obs.reward or 0.0
+
+                log_step(step=total_steps, action=f"A{agent_id}:{action_name}", reward=reward, done=new_obs.done, error=None)
+
+                histories[agent_id].append(f"Step {new_obs.current_step}: Selected '{action_name}' -> Reward {reward:+.2f}")
+
+                trajectories[agent_id].append({
+                    "step": new_obs.current_step,
+                    "action_id": action_id,
+                    "reward": reward,
+                    "cash": new_obs.cash_balance,
+                    "debt": new_obs.current_debt,
+                    "soil_n": new_obs.soil_nitrogen,
+                    "prices": [
+                        new_obs.market_price_crop_1,
+                        new_obs.market_price_crop_2,
+                        new_obs.market_price_crop_3,
+                    ]
+                })
+
+                observations[agent_id] = new_obs
+                total_steps += 1
+                
+                # Formatted Observation Logging
+                obs_details = new_obs.text_summary if getattr(new_obs, "text_summary", None) else str(new_obs)
+                print(f"\n[OBSERVATION - A{agent_id} Step {new_obs.current_step}]\n{obs_details}\n", flush=True)
+
+                if new_obs.done:
+                    done_agents.add(agent_id)
+
+        # Calculate scores
+        result = env.compute_result(trajectories)
+        score = result.aggregate_score
+        success = score >= 0.1
+        log_end(success=success, steps=total_steps, score=score, rewards=list(result.agent_scores.values()))
+
+    except Exception as e:
+        print(f"[DEBUG] Error during multi-agent episode execution: {e}", flush=True)
+        log_end(success=False, steps=total_steps, score=0.0, rewards=[])
+
+
+def run_episode(client: OpenAI, task_id: str):
+    task_info = TASKS.get(task_id, {})
+    if task_info.get("multi_agent", False):
+        run_multi_agent_episode_llm(client, task_id)
+    else:
+        run_single_agent_episode(client, task_id)
+
+
 def main():
     client = OpenAI(
         base_url=API_BASE_URL,
         api_key=API_KEY,
     )
-    for task in ["easy", "medium", "hard"]:
+    # Run tasks, including a single agent and multi agent demo
+    for task in ["easy", "easy_4agent"]:
         run_episode(client, task)
 
 
