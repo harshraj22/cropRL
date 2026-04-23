@@ -53,9 +53,11 @@ The agent manages three crop types that form a strategic triangle:
 
 | Crop | Category | Seed Cost | Growth | Base Yield | Soil Impact | Base Price |
 |------|----------|-----------|--------|------------|-------------|------------|
-| **Corn** | Heavy Feeder | ₹800 | 4 months | 8 tons | **−0.25 N** (depletes) | ₹1,200/ton |
-| **Wheat** | Medium Feeder | ₹500 | 3 months | 5 tons | −0.10 N (mild drain) | ₹800/ton |
+| **Corn** | Heavy Feeder | ₹800 | 4 months | 8 tons | **−0.32 N** (depletes) | ₹1,200/ton |
+| **Wheat** | Medium Feeder | ₹500 | 3 months | 5 tons | **−0.21 N** (mild drain) | ₹800/ton |
 | **Chickpea** | Legume | ₹200 | 3 months | 3 tons | **+0.15 N** (restores) | ₹500/ton |
+
+*Note: Soil impacts are totals evaluated over the growth period and are configurable via config.py.*
 
 **The core tension:** Corn is the most profitable but destroys the soil. Chickpea restores it but earns less. A model that learns Corn monoculture will see yields collapse within a few cycles as nitrogen depletes. The optimal policy involves **crop rotation** — a concept the agent must discover on its own.
 
@@ -70,23 +72,25 @@ Each month, the agent receives a full dashboard:
 - **Finances** — cash balance, debt, current interest rate
 - **Market Prices** — current spot prices for all three crops
 - **Storage** — what's in the warehouse and how old it is
-- **Available Actions** — which of the 11 actions are currently valid
+- **Available Actions** — which of the 15 actions are currently valid
 
 ## What the Agent Can Do
 
-Each month, the agent picks one of 11 actions:
+Each month, the agent picks one of 15 actions:
 
 | ID | Action | Effect |
 |----|--------|--------|
-| 0 | Wait | Do nothing this month |
+| 0 | Wait / No-Op | Do nothing but consume 1 action slot |
 | 1–3 | Plant Corn / Wheat / Chickpea | Spend seed cost, occupy land |
-| 4 | Irrigate | Spend ₹300, mitigate 70% of drought impact on crops |
+| 4 | Irrigate | Spend ₹300, dynamically boost soil water level depending on the crop (configurable via config.py) |
 | 5 | Fertilize | Spend ₹400, boost soil nitrogen by +0.15 |
 | 6 | Harvest & Store | Clear land, put harvest in warehouse |
-| 7 | Harvest & Sell | Clear land, sell immediately at current market price |
-| 8 | Sell Inventory | Sell whatever is in storage |
+| 7 | Harvest & Sell | Clear land, queue sale for month-end clearing |
+| 8 | Sell Inventory | Queue stored crops for month-end sale |
 | 9 | Take Loan | Get ₹5,000 cash, start accumulating interest |
 | 10 | Repay Loan | Pay off full debt if you have enough cash |
+| 11 | Post Forum Message | Send a short message to other agents |
+| 12–14 | Plant Matcha / Quinoa / Turmeric | Plant a hype crop (boom/bust pricing) |
 
 Invalid actions (e.g., planting when a crop is already growing) are penalized (−50 reward) and no-op'd.
 
