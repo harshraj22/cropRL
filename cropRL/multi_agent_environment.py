@@ -440,7 +440,7 @@ class MultiAgentCroprlEnvironment(
 
         # 3. Advance physics for every farm (in lockstep)
         for i, farm in enumerate(self._farms):
-            farm_msgs = farm.advance_month()
+            farm_msgs = farm.advance_month(skip_price_generation=True)
             for m in farm_msgs:
                 messages.append(f"[Farm {i}] {m}")
 
