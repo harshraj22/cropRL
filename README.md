@@ -40,9 +40,11 @@ The agent manages three crop types that form a strategic triangle:
 
 | Crop | Category | Seed Cost | Growth | Base Yield | Soil Impact | Base Price |
 |------|----------|-----------|--------|------------|-------------|------------|
-| **Corn** | Heavy Feeder | ₹800 | 4 months | 8 tons | **−0.25 N** (depletes) | ₹1,200/ton |
-| **Wheat** | Medium Feeder | ₹500 | 3 months | 5 tons | −0.10 N (mild drain) | ₹800/ton |
+| **Corn** | Heavy Feeder | ₹800 | 4 months | 8 tons | **−0.32 N** (depletes) | ₹1,200/ton |
+| **Wheat** | Medium Feeder | ₹500 | 3 months | 5 tons | **−0.21 N** (mild drain) | ₹800/ton |
 | **Chickpea** | Legume | ₹200 | 3 months | 3 tons | **+0.15 N** (restores) | ₹500/ton |
+
+*Note: Soil impacts are totals evaluated over the growth period and are configurable via config.py.*
 
 **The core tension:** Corn is the most profitable but destroys the soil. Chickpea restores it but earns less. A model that learns Corn monoculture will see yields collapse within a few cycles as nitrogen depletes. The optimal policy involves **crop rotation** — a concept the agent must discover on its own.
 
@@ -61,19 +63,21 @@ Each month, the agent receives a full dashboard:
 
 ## What the Agent Can Do
 
-Each month, the agent picks one of 11 actions:
+Each step, the agent picks one of 15 actions:
 
 | ID | Action | Effect |
 |----|--------|--------|
-| 0 | Wait | Do nothing this month |
+| 0 | Wait / End Turn | End your turn for this month |
 | 1–3 | Plant Corn / Wheat / Chickpea | Spend seed cost, occupy land |
-| 4 | Irrigate | Spend ₹300, mitigate 70% of drought impact on crops |
+| 4 | Irrigate | Spend ₹300, dynamically boost soil water level depending on the crop (configurable via config.py) |
 | 5 | Fertilize | Spend ₹400, boost soil nitrogen by +0.15 |
 | 6 | Harvest & Store | Clear land, put harvest in warehouse |
-| 7 | Harvest & Sell | Clear land, sell immediately at current market price |
-| 8 | Sell Inventory | Sell whatever is in storage |
+| 7 | Harvest & Sell | Clear land, queue sale for month-end clearing |
+| 8 | Sell Inventory | Queue stored crops for month-end sale |
 | 9 | Take Loan | Get ₹5,000 cash, start accumulating interest |
 | 10 | Repay Loan | Pay off full debt if you have enough cash |
+| 11 | Post Forum Message | Send a short message to other agents |
+| 12–14 | Plant Matcha / Quinoa / Turmeric | Plant a hype crop (boom/bust pricing) |
 
 Invalid actions (e.g., planting when a crop is already growing) are penalized (−50 reward) and no-op'd.
 
@@ -174,16 +178,141 @@ The environment supports three difficulty presets:
 
 **Easy** removes loan interest entirely and gives generous starting capital — the agent just needs to learn crop rotation basics. **Hard** starts with less cash and punishing interest rates, requiring tight financial management.
 
+## Multi-Agent Mode
+
+CropRL supports N independent farmers operating on a shared market. Each farmer owns a private plot of land (with its own soil, water, crop) but sells into a common marketplace where supply dynamics affect clearing prices.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│         MultiAgentCroprlEnvironment (OpenEnv)           │
+│                                                         │
+│  ┌──────────┐  ┌──────────┐       ┌──────────┐         │
+│  │ FarmState │  │ FarmState │  ...  │ FarmState │        │
+│  │  Agent 0  │  │  Agent 1  │       │  Agent N  │       │
+│  └──────────┘  └──────────┘       └──────────┘         │
+│                                                         │
+│  ┌────────────────┐  ┌──────────────────────────┐       │
+│  │ TimeController  │  │ MarketEngine (batch sell) │      │
+│  └────────────────┘  └──────────────────────────┘       │
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐                     │
+│  │ PublicLedger  │  │    Forum     │                     │
+│  └──────────────┘  └──────────────┘                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**`MultiAgentCroprlEnvironment`** implements the OpenEnv `Environment` interface directly. Each farmer's state is held in a plain `FarmState` object (no OpenEnv overhead). Single-agent mode is just `num_agents=1`.
+
+### How It Works
+
+**Turn-based action slots.** Each month, every agent gets K action slots (default 4). Agents take turns in round-robin order. An agent can:
+- Take actions (plant, irrigate, fertilize, harvest, loan, forum) — each costs 1 slot
+- End their turn early (action 0 / Wait)
+
+**The month advances only when all agents have ended their turn** (either explicitly or by exhausting their slots).
+
+### Two-Phase Step Protocol
+
+Actions are split into **immediate** and **deferred**:
+
+| Phase | Actions | When they execute |
+|-------|---------|-------------------|
+| **Immediate** | Plant, Irrigate, Fertilize, Harvest & Store, Loan, Forum | Instantly when submitted |
+| **Deferred** | Harvest & Sell, Sell Inventory | Queued → cleared at month-end |
+
+**Why deferred sells?** When the month ends, the MarketEngine resolves all queued sell orders in a single batch. If 3 agents all try to sell Corn, the clearing price drops for everyone — this creates a coordination problem that rewards communication via the Forum.
+
+### Supply-Aware Market Clearing
+
+At month-end, the MarketEngine calculates the **clearing price** based on total supply:
+
+```
+clearing_price = base_price / (1 + α × max(0, num_sellers - 1))
+```
+
+Where α (default 0.15) controls the price pressure. A single seller gets full price; 4 sellers of the same crop see a ~31% discount. This incentivizes crop diversification across the village.
+
+### Communication: The Forum
+
+Each agent gets a limited number of forum posts per month (default 2). Messages are visible to all agents in their observation. The forum resets every month.
+
+Example use: *"I'm planting Corn this month"* — other agents can respond by planting Wheat or Chickpea to avoid oversupply.
+
+### Hype Crops
+
+Three additional "hype crops" (Matcha, Quinoa, Turmeric) follow unpredictable boom/bust cycles:
+- **Rising phase**: hype level increases, premium multiplier grows
+- **Peak**: maximum premium but high saturation risk
+- **Crash**: hype collapses, prices plummet
+
+Agents see a "Social Media Trends" indicator showing the current hype level and phase for each crop.
+
+### Inter-Agent Visibility
+
+Each agent's observation includes:
+- **Other agents' crops** — what neighbours have planted this month (visible via the public ledger)
+- **Forum messages** — all posts from all agents this month
+- **Last month's clearing prices** — the actual prices from the previous batch clearing
+- **Hype crop statuses** — current phase and hype level for each hype crop
+
+### Available Tasks
+
+| Task | Agents | Description |
+|------|--------|-------------|
+| `easy` | 1 | No interest, stable weather, generous capital |
+| `medium` | 1 | Standard conditions |
+| `hard` | 1 | Low capital, high interest, volatile markets |
+| `easy_4agent` | 4 | Easy difficulty, 4 competing farmers |
+| `medium_4agent` | 4 | Standard difficulty, 4 competing farmers |
+| `hard_8agent` | 8 | Hard difficulty, 8 competing farmers |
+
+Variants exist for 2, 4, and 8 agents at each difficulty.
+
+### Episode Loop (Inference)
+
+```python
+from cropRL.tasks import create_env_for_task
+from cropRL.models import MultiAgentAction
+
+# Works for both single-agent and multi-agent tasks
+env = create_env_for_task("easy_4agent", text_mode=True)
+env.reset(seed=42)
+n = env._ma_cfg.num_agents  # 4
+
+while not all_done:
+    for agent_id in range(n):
+        obs = env.get_obs(agent_id)  # always fresh
+        if obs.done:
+            continue
+        action_id = decide(obs)  # your agent logic here
+        action = MultiAgentAction(action_id=action_id, agent_id=agent_id)
+        env.step(action)
+
+result = env.compute_result(trajectories)
+print(result.aggregate_score)
+```
+
+### Scoring Modes
+
+| Mode | Aggregate Score |
+|------|----------------|
+| `competitive` | Max of individual agent scores |
+| `cooperative` | Mean of individual agent scores |
+| `mixed` | Weighted blend of individual + village average |
+
+The **Gini coefficient** of final net worths is also reported to measure inequality.
+
 ---
 
 ## Reward Signal
 
-Each step's reward = `Δcash + penalties + terminal_bonus`
+Each step's reward = `Δ(net_worth)` (the change in net worth from the previous step).
 
-- **Cash delta** — the change in cash balance from the previous step (revenue − costs)
+- **Cash delta** — revenue minus costs
 - **Invalid action penalty** — −50 for attempting unavailable actions
-- **Bankruptcy penalty** — −1,000 if cash goes negative with active debt
-- **Terminal soil bonus** — on the final step: `soil_nitrogen × 10,000` (incentivizes long-term sustainability over pure extraction)
+- **Bankruptcy** — episode ends immediately if cash goes negative with active debt
 
 ---
 
@@ -197,6 +326,5 @@ See [IDEAS.md](./IDEAS.md) for planned extensions including:
 - **Machinery system** with degradation and repair costs
 - **Storage costs** creating sell-vs-hold pressure
 - **Dynamic costs** for seeds and inputs
-- **Multi-field farming** for more complex spatial planning
 - **Action masking** for efficient RL training
 

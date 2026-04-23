@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import Optional
 
 from .config import EnvConfig, MultiAgentConfig
-from .server.cropRL_environment import CroprlEnvironment
 
 
 # ── Single-agent tasks ──────────────────────────────────────────────────────
@@ -89,36 +88,53 @@ for _difficulty in ("easy", "medium", "hard"):
 
 
 def create_env_for_task(
-    task_id: str, text_mode: bool = False
-) -> CroprlEnvironment:
+    task_id: str,
+    text_mode: bool = False,
+    objective_mode: str = "competitive",
+) -> "MultiAgentCroprlEnvironment":
     """
-    Create a CroprlEnvironment configured for the given task.
+    Create a MultiAgentCroprlEnvironment configured for the given task.
+
+    For single-agent tasks (``"easy"``, ``"medium"``, ``"hard"``), the
+    environment is created with ``num_agents=1``.
+
+    For multi-agent tasks (``"easy_4agent"``, etc.), the agent count is
+    read from the task definition.
 
     Parameters
     ----------
     task_id : str
-        One of ``"easy"``, ``"medium"``, ``"hard"``.
+        Any recognised task id (single-agent or multi-agent).
     text_mode : bool
-        Whether to enable text observation mode (for LLM agents).
+        Enable text observation mode (for LLM agents).
+    objective_mode : str
+        ``"competitive"``, ``"cooperative"``, or ``"mixed"``.
 
     Returns
     -------
-    CroprlEnvironment
-
-    Raises
-    ------
-    KeyError
-        If task_id is not recognised.
+    MultiAgentCroprlEnvironment
     """
+    from .multi_agent_environment import MultiAgentCroprlEnvironment
+
     if task_id not in TASKS:
         raise KeyError(
             f"Unknown task '{task_id}'. Available: {list(TASKS.keys())}"
         )
 
-    overrides = TASKS[task_id]["config_overrides"].copy()
+    task_info = TASKS[task_id]
+    num_agents = task_info.get("num_agents", 1)
+    overrides = task_info["config_overrides"].copy()
     overrides["text_mode"] = text_mode
-    config = EnvConfig(**overrides)
-    return CroprlEnvironment(config=config, task_id=task_id)
+    env_cfg = EnvConfig(**overrides)
+    ma_cfg = MultiAgentConfig(
+        num_agents=num_agents,
+        objective_mode=objective_mode,
+    )
+    return MultiAgentCroprlEnvironment(
+        env_config=env_cfg,
+        ma_config=ma_cfg,
+        task_id=task_id,
+    )
 
 
 def create_multi_agent_env_for_task(
@@ -357,35 +373,29 @@ def run_multi_agent_episode(
     MultiAgentResult
         Episode scoring result.
     """
-    from .multi_agent_environment import MultiAgentCroprlEnvironment
     from .models import MultiAgentAction
 
-    task_info = TASKS.get(task_id, {})
-    n = num_agents or task_info.get("num_agents", 4)
-    overrides = task_info.get("config_overrides", {})
-    env_cfg = EnvConfig(**overrides)
-    ma_cfg = MultiAgentConfig(num_agents=n)
-    env = MultiAgentCroprlEnvironment(
-        env_config=env_cfg, ma_config=ma_cfg, task_id=task_id
-    )
-
-    observations = env.reset(seed=seed)
+    env = create_env_for_task(task_id)
+    env.reset(seed=seed)
+    n = env._ma_cfg.num_agents
     trajectories: dict = {i: [] for i in range(n)}
 
     fn = agent_fn or (lambda aid, obs: _rule_based_action(obs))
     done_agents: set = set()
-    max_steps = env_cfg.max_steps * n  # upper bound on total interactions
+    max_steps = env._env_cfg.max_steps * n
     total_steps = 0
 
     while len(done_agents) < n and total_steps < max_steps:
         for agent_id in range(n):
             if agent_id in done_agents:
                 continue
-            obs = observations[agent_id]
+            obs = env.get_obs(agent_id)
+            if obs.done:
+                done_agents.add(agent_id)
+                continue
             action_id = fn(agent_id, obs)
             action = MultiAgentAction(action_id=action_id, agent_id=agent_id)
-            new_obs = env.step(agent_id, action)
-            observations[agent_id] = new_obs
+            new_obs = env.step(action)
             trajectories[agent_id].append({
                 "prices": [
                     new_obs.market_price_crop_1,
@@ -400,3 +410,4 @@ def run_multi_agent_episode(
         total_steps += 1
 
     return env.compute_result(trajectories)
+

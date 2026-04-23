@@ -14,15 +14,15 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 
 # Ensure the root directory is on the path so cropRL module works anywhere
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import OpenAI
 
-from cropRL.tasks import create_env_for_task, create_multi_agent_env_for_task, grader, TASKS
-from cropRL.models import CroprlAction, MultiAgentAction
+from cropRL.tasks import create_env_for_task, grader, TASKS
+from cropRL.models import MultiAgentAction
 from cropRL.enums import ActionType, CropType
 
 # ── Configuration ──────────────────────────────────────────────
@@ -30,7 +30,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:11434/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "ollama")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma4:e4b")
 TEMPERATURE = 0.0  # Set to 0 to prevent erratic thinking tokens
-MAX_TOKENS = 10  # Hugely reduced to prevent the model from rambling or thinking
+MAX_TOKENS = 50  # Increased to prevent the model from rambling or thinking, but allow messages
 
 SYSTEM_PROMPT = """\
 You are an expert farm manager AI. You manage a small Indian farm over 60 months.
@@ -38,7 +38,7 @@ You may be competing or cooperating with other AI farmers in the village.
 
 OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by the end of 60 months.
 
-ACTIONS (reply with ONLY the action number):
+ACTIONS (reply with ONLY the action number, or if action 11, reply with: 11 <your message>):
 0: Wait / End Turn — Complete your actions for this month.
 1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. 
 2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
@@ -50,7 +50,7 @@ ACTIONS (reply with ONLY the action number):
 8: Sell Inventory — Queue stored crops for month-end sale.
 9: Take Loan — Get cash (only if no active loan). Interest locked at current rate.
 10: Repay Loan — Pay off full debt (must have enough cash).
-11: Post Forum Message — Send a short intent message to other agents.
+11: Post Forum Message — Send a short intent message to other agents. Format: 11 <your message>
 12: Plant Matcha (Hype Crop) — High hype premium but saturates fast.
 13: Plant Quinoa (Hype Crop) — Moderate hype premium.
 14: Plant Turmeric (Hype Crop) — Moderate hype premium.
@@ -74,7 +74,7 @@ KEY RULES:
 CRITICAL INSTRUCTION:
 DO NOT use <think> tags.
 DO NOT output any reasoning, chain-of-thought, or explanation.
-Respond IMMEDIATELY with ONLY a single integer (0-14).
+Respond IMMEDIATELY with ONLY a single integer (0-14), or if using action 11, the integer followed by your message.
 """
 
 
@@ -140,33 +140,60 @@ def rule_based_agent(obs) -> int:
     return ActionType.WAIT
 
 
-def parse_action(response_text: str, fallback_action: int) -> int:
-    """Extract an action integer from the LLM response."""
+def parse_action(response_text: str, fallback_action: int) -> tuple[int, Optional[str]]:
+    """Extract an action integer and optional message from the LLM response."""
     cleaned = response_text.strip()
-    if cleaned.isdigit():
-        val = int(cleaned)
+    
+    # Check if the string matches the pattern "action_id message"
+    matched = re.match(r"^(\d{1,2})(?:[:\s-]+(.+))?", cleaned)
+    if matched:
+        val = int(matched.group(1))
         if 0 <= val <= 14:
-            return val
+            message = matched.group(2).strip() if matched.group(2) else None
+            return val, message
+            
     matches = re.findall(r"\b(\d{1,2})\b", cleaned)
     for match in matches:
         val = int(match)
         if 0 <= val <= 14:
-            return val
-    return fallback_action
+            return val, None
+    return fallback_action, None
 
 
-def get_model_action(client: OpenAI, obs, history: List[str]) -> int:
+def get_agent_system_prompt(agent_id: int, num_agents: int) -> str:
+    """Build a per-agent system prompt with identity context."""
+    return SYSTEM_PROMPT + (
+        f"\n\nAGENT IDENTITY:\n"
+        f"You are Agent {agent_id} (out of {num_agents} farmers in this village).\n"
+        f"Your farm is independent — you have your own land, cash, and crops.\n"
+        f"You can see what other agents plant (via the observation) and \n"
+        f"communicate via the Forum. Coordinate to avoid saturating the market \n"
+        f"with the same crop — if multiple agents sell the same crop, the \n"
+        f"clearing price drops for everyone.\n"
+    )
+
+
+def get_model_action(
+    client: OpenAI, obs, history: List[str],
+    agent_id: Optional[int] = None, num_agents: int = 1,
+) -> tuple[int, Optional[str]]:
     fallback = rule_based_agent(obs)
     user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
 
     history_block = "\n".join(history[-12:]) if history else "None"
     user_msg += f"\n\nRecent History:\n{history_block}"
 
+    # Use per-agent prompt if agent_id is provided (multi-agent mode)
+    if agent_id is not None:
+        prompt = get_agent_system_prompt(agent_id, num_agents)
+    else:
+        prompt = SYSTEM_PROMPT
+
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": user_msg},
             ],
             temperature=TEMPERATURE,
@@ -176,13 +203,13 @@ def get_model_action(client: OpenAI, obs, history: List[str]) -> int:
         return parse_action(response, fallback)
     except Exception as e:
         print(f"[DEBUG] LLM error: {e}", file=sys.stderr)
-        return fallback
+        return fallback, None
 
 
 def run_single_agent_episode(client: OpenAI, task_id: str):
-    # Pass text_mode=True so obs has a .text_summary
+    """Run a single-agent episode using MultiAgentCroprlEnvironment with num_agents=1."""
     env = create_env_for_task(task_id, text_mode=True)
-    obs = env.reset(seed=42)
+    env.reset(seed=42)
 
     history: List[str] = []
     rewards: List[float] = []
@@ -191,35 +218,33 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
     success = False
 
     log_start(task=task_id, env="croprl", model=MODEL_NAME)
-
-    # Log initial observation so we can clearly see the starting state
-    obs_details = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
-    print(f"\n[OBSERVATION - INITIAL]\n{obs_details}\n", flush=True)
-
-    trajectory = []
+    max_steps = env._env_cfg.max_steps
+    trajectory: list = []
 
     try:
-        for step in range(1, env.config.max_steps + 1):
+        for step in range(1, max_steps + 1):
+            # Always fetch fresh observation
+            obs = env.get_obs(0)
+
             if obs.done:
                 break
 
-            action_id = get_model_action(client, obs, history)
-            action_name = env.config.action_names[action_id] if action_id < len(env.config.action_names) else f"Action {action_id}"
+            obs_details = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
+            print(f"\n[OBSERVATION - Step {step}]\n{obs_details}\n", flush=True)
 
-            action = CroprlAction(action_id=action_id)
-            obs = env.step(action)
+            action_id, forum_message = get_model_action(client, obs, history, agent_id=0, num_agents=1)
+            action_name = env._env_cfg.action_names[action_id] if action_id < len(env._env_cfg.action_names) else f"Action {action_id}"
 
-            reward = obs.reward or 0.0
-            done = obs.done
+            action = MultiAgentAction(action_id=action_id, agent_id=0, forum_message=forum_message)
+            result_obs = env.step(action)
+
+            reward = result_obs.reward or 0.0
+            done = result_obs.done
 
             rewards.append(reward)
             steps_taken = step
 
             log_step(step=step, action=action_name, reward=reward, done=done, error=None)
-
-            # Formatted Observation Logging
-            obs_details = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
-            print(f"\n[OBSERVATION - Step {step}]\n{obs_details}\n", flush=True)
 
             history.append(f"Step {step}: Selected '{action_name}' -> Reward {reward:+.2f}")
 
@@ -227,34 +252,22 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
                 "step": step,
                 "action_id": action_id,
                 "reward": reward,
-                "cash": obs.cash_balance,
-                "debt": obs.current_debt,
-                "soil_n": obs.soil_nitrogen,
+                "cash": result_obs.cash_balance,
+                "debt": result_obs.current_debt,
+                "soil_n": result_obs.soil_nitrogen,
                 "prices": [
-                    obs.market_price_crop_1,
-                    obs.market_price_crop_2,
-                    obs.market_price_crop_3,
+                    result_obs.market_price_crop_1,
+                    result_obs.market_price_crop_2,
+                    result_obs.market_price_crop_3,
                 ]
             })
 
             if done:
                 break
 
-        # Calculate score using the grader
-        final_net_worth = (
-            obs.cash_balance
-            - obs.current_debt
-            + obs.current_land_price
-            + (obs.stored_amount * obs.market_price_crop_1  # approximate
-               if obs.stored_crop_type > 0 else 0)
-        )
-        score = grader(
-            task_id, final_net_worth,
-            obs.done and obs.cash_balance < 0,
-            trajectory,
-        )
-        score = max(0.01, min(0.99, score))
-
+        # Use compute_result for consistent scoring
+        result = env.compute_result({0: trajectory})
+        score = result.aggregate_score
         success = score >= 0.1
 
     except Exception as e:
@@ -264,13 +277,14 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
 
 
 def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
-    env = create_multi_agent_env_for_task(task_id, text_mode=True)
-    observations = env.reset(seed=42)
+    """Run a multi-agent episode with LLM agents."""
+    env = create_env_for_task(task_id, text_mode=True)
+    env.reset(seed=42)
     n = env._ma_cfg.num_agents
 
     histories: Dict[int, List[str]] = {i: [] for i in range(n)}
     trajectories: Dict[int, List[dict]] = {i: [] for i in range(n)}
-    done_agents = set()
+    done_agents: set = set()
 
     max_steps = env._env_cfg.max_steps * n
     total_steps = 0
@@ -285,20 +299,21 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
                 if agent_id in done_agents:
                     continue
 
-                obs = observations[agent_id]
-                
+                # Always fetch fresh observation — no caching needed
+                obs = env.get_obs(agent_id)
+
                 if obs.done:
                     done_agents.add(agent_id)
                     continue
 
-                action_id = get_model_action(client, obs, histories[agent_id])
+                action_id, forum_message = get_model_action(client, obs, histories[agent_id], agent_id=agent_id, num_agents=n)
                 action_name = env._env_cfg.action_names[action_id] if action_id < len(env._env_cfg.action_names) else f"Action {action_id}"
-                
-                # Setup MultiAgentAction specifically
-                action = MultiAgentAction(action_id=action_id, agent_id=agent_id)
-                new_obs = env.step(agent_id, action)
+
+                action = MultiAgentAction(action_id=action_id, agent_id=agent_id, forum_message=forum_message)
+                new_obs = env.step(action)
 
                 reward = new_obs.reward or 0.0
+                total_steps += 1
 
                 log_step(step=total_steps, action=f"A{agent_id}:{action_name}", reward=reward, done=new_obs.done, error=None)
 
@@ -318,17 +333,12 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
                     ]
                 })
 
-                observations[agent_id] = new_obs
-                total_steps += 1
-                
-                # Formatted Observation Logging
                 obs_details = new_obs.text_summary if getattr(new_obs, "text_summary", None) else str(new_obs)
                 print(f"\n[OBSERVATION - A{agent_id} Step {new_obs.current_step}]\n{obs_details}\n", flush=True)
 
                 if new_obs.done:
                     done_agents.add(agent_id)
 
-        # Calculate scores
         result = env.compute_result(trajectories)
         score = result.aggregate_score
         success = score >= 0.1

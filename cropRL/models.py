@@ -165,3 +165,13 @@ class MultiAgentResult(BaseModel):
     gini_coefficient:  float             # 0=equal, 1=monopoly
     total_village_nw:  float             # sum of all final net worths
 
+
+class MultiAgentState(State):
+    """Internal state for the multi-agent environment."""
+    num_agents: int = 0
+    current_month: int = 1
+    month_count: int = 0
+    episode_id: str = ""
+    task_id: str = "default"
+
+

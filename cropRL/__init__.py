@@ -25,7 +25,9 @@ from .models import (
     MultiAgentAction,
     MultiAgentObservation,
     MultiAgentResult,
+    MultiAgentState,
 )
+from .farm_state import FarmState
 from .market_engine import MarketEngine, HypeEngine
 from .public_ledger import Forum, PublicLedger
 from .time_controller import TimeController, TurnOverError
@@ -60,6 +62,9 @@ __all__ = [
     "MultiAgentAction",
     "MultiAgentObservation",
     "MultiAgentResult",
+    "MultiAgentState",
+    # FarmState
+    "FarmState",
     # Engines
     "Forum",
     "HypeEngine",

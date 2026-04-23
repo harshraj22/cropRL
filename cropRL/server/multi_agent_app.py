@@ -234,7 +234,7 @@ async def http_step(req: StepRequest) -> Dict[str, Any]:
         forum_message=req.forum_message,
     )
 
-    obs = session.env.step(req.agent_id, action)
+    obs = session.env.step(action)
 
     # Track trajectory for grading
     if req.agent_id not in session.trajectories:
@@ -322,7 +322,7 @@ async def websocket_agent(
 
     try:
         # Send initial observation on connect
-        obs = session.env._build_ma_obs(agent_id, "Connected to session.", 0.0, False)
+        obs = session.env.get_obs(agent_id)
         await websocket.send_text(json.dumps({
             "event": "OBSERVATION",
             "observation": obs.model_dump(),
@@ -355,7 +355,7 @@ async def websocket_agent(
                 forum_message=data.get("forum_message"),
             )
 
-            obs = session.env.step(agent_id, action)
+            obs = session.env.step(action)
 
             # Track trajectory
             if agent_id not in session.trajectories:
