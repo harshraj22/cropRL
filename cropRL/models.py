@@ -71,6 +71,9 @@ class CroprlObservation(Observation):
     cost_seed_1: float = Field(description="Cost to plant Corn")
     cost_seed_2: float = Field(description="Cost to plant Wheat")
     cost_seed_3: float = Field(description="Cost to plant Chickpea")
+    cost_seed_4: float = Field(description="Cost to plant Matcha (Hype)")
+    cost_seed_5: float = Field(description="Cost to plant Quinoa (Hype)")
+    cost_seed_6: float = Field(description="Cost to plant Turmeric (Hype)")
     cost_irrigate: float = Field(description="Cost to irrigate")
     cost_fertilize: float = Field(description="Cost to fertilize")
 

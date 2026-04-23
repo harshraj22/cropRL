@@ -363,19 +363,19 @@ class MarketEngine:
 
         base = inflated_base_prices or self._base_prices
 
-        # The existing dynamics function generates 3 prices (crops 1-3).
-        p1, p2, p3 = generate_market_prices(
+        # The existing dynamics function generates prices for all crops except Fallow.
+        generated_prices = generate_market_prices(
             month=month,
             config=self._env_cfg,
             rng=self._rng,
             prev_prices=self._prev_prices,
             effective_base_prices=tuple(base),
         )
-        # Extend for hype crops (they use their own base price + hype_mult)
+        
         new_prices = list(base)  # copy
-        new_prices[1] = p1
-        new_prices[2] = p2
-        new_prices[3] = p3
+        for i in range(1, self._env_cfg.num_crop_types):
+            new_prices[i] = generated_prices[i - 1]
+
         # Hype crops 4-6 get small random walk independently
         for hc in range(4, self._env_cfg.num_crop_types):
             hc_base = base[hc]

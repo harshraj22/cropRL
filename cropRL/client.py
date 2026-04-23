@@ -31,6 +31,7 @@ class CroprlEnv(EnvClient[CroprlAction, CroprlObservation, CroprlState]):
                 cash_balance=obs_data.get("cash_balance", 0.0),
                 current_debt=obs_data.get("current_debt", 0.0),
                 current_interest_rate=obs_data.get("current_interest_rate", 0.0),
+                current_land_price=obs_data.get("current_land_price", 0.0),
                 market_price_crop_1=obs_data.get("market_price_crop_1", 0.0),
                 market_price_crop_2=obs_data.get("market_price_crop_2", 0.0),
                 market_price_crop_3=obs_data.get("market_price_crop_3", 0.0),

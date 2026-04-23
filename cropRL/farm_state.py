@@ -463,16 +463,18 @@ class FarmState:
     # Net worth
     # ──────────────────────────────────────────────────────────────
 
-    def compute_net_worth(self) -> float:
+    def compute_net_worth(self, clearing_prices: Optional[Tuple[float, ...]] = None) -> float:
         """net_worth = cash + land_value + stored_value + growing_value − debt"""
         s = self._s
         cfg = self.config
+        
+        prices_to_use = clearing_prices if clearing_prices is not None else s["prices"]
 
         land_value = s["inflated_base_land_price"] * s["soil_nitrogen"]
 
         stored_value = 0.0
         if s["stored_amount"] > 0 and s["stored_crop_type"] != CropType.FALLOW:
-            stored_value = s["stored_amount"] * s["prices"][s["stored_crop_type"] - 1]
+            stored_value = s["stored_amount"] * prices_to_use[s["stored_crop_type"] - 1]
 
         growing_value = 0.0
         if s["active_crop_type"] != CropType.FALLOW:
@@ -481,7 +483,7 @@ class FarmState:
                 s["soil_nitrogen"], s["water_level"],
                 s["planting_month"] or s["month"], cfg, rng=None,
             )
-            growing_value = est_yield * s["prices"][s["active_crop_type"] - 1]
+            growing_value = est_yield * prices_to_use[s["active_crop_type"] - 1]
 
         return s["cash"] + land_value + stored_value + growing_value - s["debt"]
 

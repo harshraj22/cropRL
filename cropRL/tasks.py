@@ -402,6 +402,9 @@ def run_multi_agent_episode(
                     new_obs.market_price_crop_1,
                     new_obs.market_price_crop_2,
                     new_obs.market_price_crop_3,
+                    new_obs.market_price_crop_4,
+                    new_obs.market_price_crop_5,
+                    new_obs.market_price_crop_6,
                 ]
             })
             if verbose:

@@ -80,11 +80,7 @@ class MultiAgentCroprlEnvironment(
         self._market: Optional[MarketEngine] = None
         self._shared_rng: Optional[np.random.Generator] = None
         self._hype_statuses: list = []
-        self._last_realised: Tuple[float, ...] = (
-            self._env_cfg.base_market_prices[1],
-            self._env_cfg.base_market_prices[2],
-            self._env_cfg.base_market_prices[3],
-        )
+        self._last_realised: Tuple[float, ...] = tuple(self._env_cfg.base_market_prices[1:])
 
         self.episode_id: str = ""
         self._state = MultiAgentState(
@@ -168,7 +164,7 @@ class MultiAgentCroprlEnvironment(
             return self._build_ma_obs(
                 agent_id,
                 "You have exhausted your action slots for this month. Waiting for others.",
-                self._env_cfg.invalid_action_penalty,
+                0.0,
                 False,
             )
 
@@ -355,7 +351,7 @@ class MultiAgentCroprlEnvironment(
         net_worths: Dict[int, float] = {}
 
         for i, farm in enumerate(self._farms):
-            nw = farm.compute_net_worth()
+            nw = farm.compute_net_worth(clearing_prices=self._last_realised)
             net_worths[i] = nw
             traj = (trajectories or {}).get(i, [])
             bankrupt = farm.cash < 0 and farm.has_active_loan
@@ -609,7 +605,7 @@ class MultiAgentCroprlEnvironment(
         if self._last_realised:
             lines.append("")
             lines.append("LAST MONTH CLEARING PRICES:")
-            names = self._cfg.crop_names[1:]
+            names = self._env_cfg.crop_names[1:]
             for name, price in zip(names, self._last_realised):
                 lines.append(f"  {name}: ₹{price:,.0f}/ton")
 
