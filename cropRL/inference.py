@@ -170,7 +170,7 @@ def get_agent_system_prompt(agent_id: int, num_agents: int) -> str:
         f"You can see what other agents plant (via the observation) and \n"
         f"communicate via the Forum. Coordinate to avoid saturating the market \n"
         f"with the same crop — if multiple agents sell the same crop, the \n"
-        f"clearing price drops for everyone.\n"
+        f"clearing price drops for everyone. Messages are limited to 150 chars\n"
     )
 
 
