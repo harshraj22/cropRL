@@ -252,11 +252,12 @@ def grader(
         prices = step_data.get("prices", list(cfg.base_market_prices[1:]))
 
         # Monthly amortized profit: (price × max_yield − seed_cost) / growth_months
-        corn_prof = ((prices[0] * cfg.base_yield_tons[1]) - cfg.seed_costs[1]) / float(cfg.growth_months[1])
-        wheat_prof = ((prices[1] * cfg.base_yield_tons[2]) - cfg.seed_costs[2]) / float(cfg.growth_months[2])
-        chickpea_prof = ((prices[2] * cfg.base_yield_tons[3]) - cfg.seed_costs[3]) / float(cfg.growth_months[3])
+        profits = [0.0]
+        for i in range(1, cfg.num_crop_types):
+            prof = ((prices[i-1] * cfg.base_yield_tons[i]) - cfg.seed_costs[i]) / float(cfg.growth_months[i])
+            profits.append(prof)
 
-        total_oracle_profit += max(0.0, corn_prof, wheat_prof, chickpea_prof)
+        total_oracle_profit += max(profits)
 
     # Oracle max net worth includes perfect soil maintenance
     oracle_land = cfg.base_land_price * 1.0  # perfect nitrogen

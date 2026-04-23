@@ -251,7 +251,7 @@ class MarketEngine:
 
         # Last month's realised prices (exposed in observation)
         self.last_month_realised_prices: Tuple[float, ...] = tuple(
-            env_config.base_market_prices[1:4]  # Corn, Wheat, Chickpea
+            env_config.base_market_prices[1:]
         )
 
         # Pending sell orders this month

@@ -13,6 +13,7 @@ STDOUT FORMAT
 import os
 import re
 import sys
+import argparse
 from pathlib import Path
 from typing import Any, List, Optional, Dict
 
@@ -361,13 +362,20 @@ def run_episode(client: OpenAI, task_id: str):
 
 
 def main():
+    global MODEL_NAME
+    parser = argparse.ArgumentParser(description="Run CropRL inference")
+    parser.add_argument("--task", type=str, default="easy", help="Task ID to run")
+    parser.add_argument("--model", type=str, default=MODEL_NAME, help="Model name")
+    args = parser.parse_args()
+    
+    MODEL_NAME = args.model
+
     client = OpenAI(
         base_url=API_BASE_URL,
         api_key=API_KEY,
     )
-    # Run tasks, including a single agent and multi agent demo
-    for task in ["easy", "easy_4agent"]:
-        run_episode(client, task)
+    # Run task
+    run_episode(client, args.task)
 
 
 if __name__ == "__main__":

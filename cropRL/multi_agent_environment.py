@@ -456,7 +456,7 @@ class MultiAgentCroprlEnvironment(
             ),
         )
         for farm in self._farms:
-            farm.s["prices"] = (new_prices[1], new_prices[2], new_prices[3])
+            farm.s["prices"] = tuple(new_prices[1:])
 
         # 5. Reset ledger and forum
         self._ledger.reset_month()
@@ -609,7 +609,7 @@ class MultiAgentCroprlEnvironment(
         if self._last_realised:
             lines.append("")
             lines.append("LAST MONTH CLEARING PRICES:")
-            names = ["Corn", "Wheat", "Chickpea"]
+            names = self._cfg.crop_names[1:]
             for name, price in zip(names, self._last_realised):
                 lines.append(f"  {name}: ₹{price:,.0f}/ton")
 

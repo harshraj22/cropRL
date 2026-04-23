@@ -132,9 +132,9 @@ def generate_market_prices(
     month: int,
     config: EnvConfig,
     rng: np.random.Generator,
-    prev_prices: Optional[Tuple[float, float, float]] = None,
+    prev_prices: Optional[Tuple[float, ...]] = None,
     effective_base_prices: Optional[Tuple[float, ...]] = None,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, ...]:
     """
     Generate market prices for each crop type.
 
@@ -172,7 +172,7 @@ def generate_market_prices(
         and prev_prices is not None
     )
 
-    for i in range(1, 4):  # crops 1, 2, 3
+    for i in range(1, config.num_crop_types):  # all crops except fallow
         base = base_prices[i]
         target = base * seasonal_mult
         noise = rng.normal(0.0, config.market_price_sigma)
@@ -195,7 +195,7 @@ def generate_market_prices(
 
     # Demand shock: rare event affecting one random crop
     if config.demand_shock_probability > 0 and rng.random() < config.demand_shock_probability:
-        crop_idx = rng.integers(0, 3)
+        crop_idx = rng.integers(0, config.num_crop_types - 1)
         direction = rng.choice([-1, 1])
         lo, hi = config.demand_shock_magnitude
         magnitude = rng.uniform(lo, hi)
@@ -205,8 +205,7 @@ def generate_market_prices(
         ceiling = base * config.price_max_multiplier
         prices[crop_idx] = float(np.clip(prices[crop_idx] * shock_mult, floor, ceiling))
 
-    return (prices[0], prices[1], prices[2])
-
+    return tuple(prices)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # D. Yield Calculation
