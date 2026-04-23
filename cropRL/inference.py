@@ -20,18 +20,17 @@ from typing import Any, List, Optional, Dict
 # Ensure the root directory is on the path so cropRL module works anywhere
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from openai import OpenAI
+import json
+import ollama
 
 from cropRL.tasks import create_env_for_task, grader, TASKS
 from cropRL.models import MultiAgentAction
 from cropRL.enums import ActionType, CropType
 
 # ── Configuration ──────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:11434/v1")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "ollama")
-MODEL_NAME = os.getenv("MODEL_NAME", "gemma4:e4b")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:11434")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5:9b")
 TEMPERATURE = 0.0  # Set to 0 to prevent erratic thinking tokens
-MAX_TOKENS = 50  # Increased to prevent the model from rambling or thinking, but allow messages
 
 SYSTEM_PROMPT = """\
 You are an expert farm manager AI. You manage a small Indian farm over 60 months.
@@ -39,7 +38,7 @@ You may be competing or cooperating with other AI farmers in the village.
 
 OBJECTIVE: Maximize your net worth (cash + land value + crop value - debt) by the end of 60 months.
 
-ACTIONS (reply with ONLY the action number, or if action 11, reply with: 11 <your message>):
+ACTIONS:
 0: Wait / No-Op — Do nothing but consume 1 action slot.
 1: Plant Corn — High cost, high yield, depletes soil nitrogen heavily. 
 2: Plant Wheat — Moderate cost/yield, mild nitrogen drain. Best in Winter.
@@ -51,7 +50,7 @@ ACTIONS (reply with ONLY the action number, or if action 11, reply with: 11 <you
 8: Sell Inventory — Queue stored crops for month-end sale.
 9: Take Loan — Get cash (only if no active loan). Interest locked at current rate.
 10: Repay Loan — Pay off full debt (must have enough cash).
-11: Post Forum Message — Send a short intent message to other agents. Format: 11 <your message>
+11: Post Forum Message — Send a short intent message to other agents.
 12: Plant Matcha (Hype Crop) — High hype premium but saturates fast.
 13: Plant Quinoa (Hype Crop) — Moderate hype premium.
 14: Plant Turmeric (Hype Crop) — Moderate hype premium.
@@ -73,9 +72,11 @@ KEY RULES:
 - Bankruptcy (negative cash + loan) ends the game with heavy penalty.
 
 CRITICAL INSTRUCTION:
-DO NOT use <think> tags.
-DO NOT output any reasoning, chain-of-thought, or explanation.
-Respond IMMEDIATELY with ONLY a single integer (0-14), or if using action 11, the integer followed by your message.
+You MUST respond with a valid JSON object. Do not provide any conversational text before or after the JSON.
+The JSON object must have exactly the following fields:
+- "thought": (string) Your reasoning for choosing the action based on the current state.
+- "action": (integer) The action number you choose (0-14).
+- "message": (string) An optional message. If you chose action 11, this must contain your message to other agents. Otherwise, you can leave it empty or null.
 """
 
 
@@ -143,22 +144,14 @@ def rule_based_agent(obs) -> int:
 
 def parse_action(response_text: str, fallback_action: int) -> tuple[int, Optional[str]]:
     """Extract an action integer and optional message from the LLM response."""
-    cleaned = response_text.strip()
-    
-    # Check if the string matches the pattern "action_id message"
-    matched = re.match(r"^(\d{1,2})(?:[:\s-]+(.+))?", cleaned)
-    if matched:
-        val = int(matched.group(1))
-        if 0 <= val <= 14:
-            message = matched.group(2).strip() if matched.group(2) else None
-            return val, message
-            
-    matches = re.findall(r"\b(\d{1,2})\b", cleaned)
-    for match in matches:
-        val = int(match)
-        if 0 <= val <= 14:
-            return val, None
-    return fallback_action, None
+    try:
+        data = json.loads(response_text)
+        action = int(data.get("action", fallback_action))
+        message = data.get("message")
+        return action, message
+    except Exception as e:
+        print(f"[DEBUG] Failed to parse JSON response: {e}")
+        return fallback_action, None
 
 
 def get_agent_system_prompt(agent_id: int, num_agents: int) -> str:
@@ -175,7 +168,7 @@ def get_agent_system_prompt(agent_id: int, num_agents: int) -> str:
 
 
 def get_model_action(
-    client: OpenAI, obs, history: List[str],
+    client: Any, obs, history: List[str],
     agent_id: Optional[int] = None, num_agents: int = 1,
 ) -> tuple[int, Optional[str]]:
     fallback = rule_based_agent(obs)
@@ -190,24 +183,27 @@ def get_model_action(
     else:
         prompt = SYSTEM_PROMPT
 
+    print(f"\n[LLM PROMPT] Agent {agent_id if agent_id is not None else 0}\nSYSTEM:\n{prompt}\nUSER:\n{user_msg}\n", flush=True)
+
     try:
-        completion = client.chat.completions.create(
+        response_obj = client.chat(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            format="json",
+            options={"temperature": TEMPERATURE}
         )
-        response = completion.choices[0].message.content or ""
-        return parse_action(response, fallback)
+        response_text = response_obj['message']['content']
+        print(f"\n[LLM RESPONSE] Agent {agent_id if agent_id is not None else 0}\n{response_text}\n", flush=True)
+        return parse_action(response_text, fallback)
     except Exception as e:
         print(f"[DEBUG] LLM error: {e}", file=sys.stderr)
         return fallback, None
 
 
-def run_single_agent_episode(client: OpenAI, task_id: str):
+def run_single_agent_episode(client: Any, task_id: str):
     """Run a single-agent episode using MultiAgentCroprlEnvironment with num_agents=1."""
     env = create_env_for_task(task_id, text_mode=True)
     env.reset(seed=42)
@@ -280,7 +276,7 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
-def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
+def run_multi_agent_episode_llm(client: Any, task_id: str):
     """Run a multi-agent episode with LLM agents."""
     env = create_env_for_task(task_id, text_mode=True)
     env.reset(seed=42)
@@ -359,7 +355,7 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
         log_end(success=False, steps=total_steps, score=0.0, rewards=[])
 
 
-def run_episode(client: OpenAI, task_id: str):
+def run_episode(client: Any, task_id: str):
     task_info = TASKS.get(task_id, {})
     if task_info.get("multi_agent", False):
         run_multi_agent_episode_llm(client, task_id)
@@ -376,10 +372,7 @@ def main():
     
     MODEL_NAME = args.model
 
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=API_KEY,
-    )
+    client = ollama.Client(host=API_BASE_URL)
     # Run task
     run_episode(client, args.task)
 
