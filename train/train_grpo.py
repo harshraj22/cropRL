@@ -166,6 +166,7 @@ def train(args):
                     old_logprobs = get_action_logprobs(model, full_seqs, gen_seqs, gen_mask)
                     
                     for idx, env_idx in enumerate(valid_env_indices):
+                        agent_id = agent_ids_for_batch[idx]
                         action_text = action_texts[idx]
                         act_id, forum_msg = parse_action(action_text, fallback_action=0)
                         
