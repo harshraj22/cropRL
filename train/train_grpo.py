@@ -86,86 +86,125 @@ def train(args):
         model.eval() # Prevent dropout noise during rollout
         
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
-        
-        # Enforce single agent to avoid non-advancing months with static rule agents
-        assert envs[0]._ma_cfg.num_agents == 1, "Training script only supports single-agent tasks (e.g., 'easy')."
+        n_agents = envs[0]._ma_cfg.num_agents
         
         for env in envs:
             env.reset()
-        observations = [env.get_obs(0) for env in envs]
         
-        # Get initial net worths for reward shaping
-        prev_net_worths = [env._inner.farms[0]._compute_net_worth() for env in envs]
+        # Get initial net worths for reward shaping (per env, per agent)
+        prev_net_worths = [[env._inner.farms[a]._compute_net_worth() for a in range(n_agents)] for env in envs]
         
         active_envs = list(range(args.group_size))
-        trajectories = [[] for _ in range(args.group_size)]
+        done_agents = {i: set() for i in range(args.group_size)}
+        trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
         
         step_count = 0
         with torch.no_grad():
             while active_envs:
                 step_count += 1
-                prompts = []
-                for i in active_envs:
-                    obs = observations[i]
-                    user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
-                    prompt = get_agent_system_prompt(0, 1) + "\n\n" + user_msg + "\nAction:"
-                    prompts.append(prompt)
-                
-                inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
-                
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                
-                gen_seqs = outputs[:, inputs.input_ids.shape[1]:]
-                action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
-                
-                # Mask out right-padding in generation
-                gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
-                full_seqs = outputs
-                old_logprobs = get_action_logprobs(model, full_seqs, gen_seqs, gen_mask)
-                
-                new_active_envs = []
-                for idx, env_idx in enumerate(active_envs):
-                    action_text = action_texts[idx]
-                    action_id, forum_msg = parse_action(action_text, fallback_action=0)
+                # Use the rotating turn order from the first active env (valid proxy for batch)
+                turn_order = envs[active_envs[0]].get_turn_order()
+                for agent_slot in range(n_agents):
+                    prompts = []
+                    valid_env_indices = []
+                    agent_ids_for_batch = []
                     
-                    action_obj = MultiAgentAction(action_id=action_id, agent_id=0, forum_message=forum_msg)
-                    next_obs = envs[env_idx].step(action_obj)
-                    
-                    # Reward shaping: Change in exact net worth (including crop/land values)
-                    current_net_worth = envs[env_idx]._inner.farms[0]._compute_net_worth()
-                    reward = current_net_worth - prev_net_worths[env_idx]
-                    prev_net_worths[env_idx] = current_net_worth
-                    
-                    trajectories[env_idx].append({
-                        "input_ids": full_seqs[idx].cpu(),
-                        "gen_seqs": gen_seqs[idx].cpu(),
-                        "gen_mask": gen_mask[idx].cpu(),
-                        "old_logprob": old_logprobs[idx].item(),
-                        "reward": reward,
-                        "net_worth": current_net_worth,
-                        "action_id": action_id
-                    })
-                    
-                    observations[env_idx] = next_obs
-                    if not next_obs.done:
-                        new_active_envs.append(env_idx)
+                    # Fetch fresh observations for this agent across active environments
+                    for env_idx in active_envs:
+                        turn_order = envs[env_idx].get_turn_order()
+                        agent_id = turn_order[agent_slot]
+                        if agent_id in done_agents[env_idx]:
+                            action_obj = MultiAgentAction(action_id=0, agent_id=agent_id, forum_message=None)
+                            envs[env_idx].step(action_obj)
+                            continue
+
+                        obs = envs[env_idx].get_obs(agent_id)
                         
-                active_envs = new_active_envs
+                        if obs.done:
+                            done_agents[env_idx].add(agent_id)
+                            # Dead/done agents must wait out their slots so they don't block TimeController
+                            action_obj = MultiAgentAction(action_id=0, agent_id=agent_id, forum_message=None)
+                            envs[env_idx].step(action_obj)
+                            continue
+                            
+                        user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
+
+                        messages = [
+                            {"role": "system", "content": get_agent_system_prompt(agent_id, n_agents)},
+                            {"role": "user", "content": user_msg}
+                        ]
+                        prompt = tokenizer.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False
+                        )
+
+                        prompts.append(prompt)
+                        valid_env_indices.append(env_idx)
+                        agent_ids_for_batch.append(agent_id)
+                    
+                    if not prompts:
+                        continue
+                        
+                    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+                    
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=True,
+                        temperature=args.temperature,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                    
+                    gen_seqs = outputs[:, inputs.input_ids.shape[1]:]
+                    action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
+                    
+                    # Mask out right-padding in generation
+                    gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
+                    full_seqs = outputs
+                    old_logprobs = get_action_logprobs(model, full_seqs, gen_seqs, gen_mask)
+                    
+                    for idx, env_idx in enumerate(valid_env_indices):
+                        action_text = action_texts[idx]
+                        act_id, forum_msg = parse_action(action_text, fallback_action=0)
+                        
+                        action_obj = MultiAgentAction(action_id=act_id, agent_id=agent_id, forum_message=forum_msg)
+                        next_obs = envs[env_idx].step(action_obj)
+                        
+                        # Reward shaping: Change in exact net worth (including crop/land values)
+                        current_net_worth = envs[env_idx]._inner.farms[agent_id]._compute_net_worth()
+                        reward = current_net_worth - prev_net_worths[env_idx][agent_id]
+                        prev_net_worths[env_idx][agent_id] = current_net_worth
+                        
+                        trajectories[env_idx][agent_id].append({
+                            "input_ids": full_seqs[idx].cpu(),
+                            "gen_seqs": gen_seqs[idx].cpu(),
+                            "gen_mask": gen_mask[idx].cpu(),
+                            "old_logprob": old_logprobs[idx].item(),
+                            "reward": reward,
+                            "action_id": act_id
+                        })
+                        
+                        if next_obs.done:
+                            done_agents[env_idx].add(agent_id)
+                            
+                # Update active envs list (only keep envs where not all agents are done)
+                active_envs = [i for i in active_envs if len(done_agents[i]) < n_agents]
         
         # --- 2. Compute Advantages (GRPO) ---
-        episode_returns = np.array([sum(step["reward"] for step in traj) for traj in trajectories])
-        mean_return = episode_returns.mean()
-        std_return = episode_returns.std() + 1e-8
-        advantages = (episode_returns - mean_return) / std_return
+        # Normalize returns across all agents and all group environments
+        all_returns = []
+        for env_idx in range(args.group_size):
+            for agent_id in range(n_agents):
+                ret = sum(step["reward"] for step in trajectories[env_idx][agent_id])
+                all_returns.append(ret)
+                
+        all_returns = np.array(all_returns)
+        mean_return = all_returns.mean()
+        std_return = all_returns.std() + 1e-8
         
-        print(f"Returns: {episode_returns.round(2)}")
+        print(f"Returns: {all_returns.round(2)}")
         print(f"Mean Return: {mean_return:.2f} | Std: {std_return:.2f}")
         
         # --- 3. Optimization Phase ---
@@ -173,16 +212,19 @@ def train(args):
         
         # Flatten dataset for randomized mini-batching
         dataset = []
-        for env_idx, traj in enumerate(trajectories):
-            A_i = advantages[env_idx]
-            for step in traj:
-                dataset.append({
-                    "input_ids": step["input_ids"],
-                    "gen_seqs": step["gen_seqs"],
-                    "gen_mask": step["gen_mask"],
-                    "old_logprob": step["old_logprob"],
-                    "A_i": A_i
-                })
+        ret_idx = 0
+        for env_idx in range(args.group_size):
+            for agent_id in range(n_agents):
+                A_i = (all_returns[ret_idx] - mean_return) / std_return
+                for step in trajectories[env_idx][agent_id]:
+                    dataset.append({
+                        "input_ids": step["input_ids"],
+                        "gen_seqs": step["gen_seqs"],
+                        "gen_mask": step["gen_mask"],
+                        "old_logprob": step["old_logprob"],
+                        "A_i": A_i
+                    })
+                ret_idx += 1
         
         # Shuffle dataset to break temporal correlations
         random.shuffle(dataset)
@@ -237,8 +279,8 @@ def train(args):
                 optim_steps += 1
                 
         # Logging
-        avg_loss = total_loss / max(1, optim_steps)
-        avg_kl = total_kl / max(1, optim_steps)
+        avg_loss = total_loss / max(1, len(dataset))
+        avg_kl = total_kl / max(1, len(dataset))
         
         wandb.log({
             "iteration": iteration,
@@ -246,8 +288,8 @@ def train(args):
             "std_return": std_return,
             "loss": avg_loss,
             "kl_divergence": avg_kl,
-            "max_return": episode_returns.max(),
-            "min_return": episode_returns.min(),
+            "max_return": all_returns.max(),
+            "min_return": all_returns.min(),
         })
         
         # Save Checkpoint
@@ -262,7 +304,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_GRPO_Run_1", help="WandB run name")
     parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")
