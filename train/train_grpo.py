@@ -131,8 +131,10 @@ def train(args):
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
         n_agents = envs[0]._ma_cfg.num_agents
         
-        for env in envs:
-            env.reset()
+        for env_idx, env in enumerate(envs):
+            # Unique seed per iteration and environment to prevent overfitting to a single weather/market trajectory
+            env_seed = (iteration * args.group_size) + env_idx
+            env.reset(seed=env_seed)
         
         # Get initial net worths for reward shaping (per env, per agent)
         prev_net_worths = [[env._farms[a].compute_net_worth() for a in range(n_agents)] for env in envs]
