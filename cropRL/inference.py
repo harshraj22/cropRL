@@ -260,6 +260,9 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
                     result_obs.market_price_crop_1,
                     result_obs.market_price_crop_2,
                     result_obs.market_price_crop_3,
+                    result_obs.market_price_crop_4,
+                    result_obs.market_price_crop_5,
+                    result_obs.market_price_crop_6,
                 ]
             })
 
