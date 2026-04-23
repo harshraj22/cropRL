@@ -88,41 +88,13 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
 
         # Internal farm state
         self._internal = {
-            "month": month,
-            "step": step,
-            "month_count": 0,
-            "year": 1,
-            "expected_rainfall": rainfall,
-            "prices": prices,
-            "interest_rate": interest_rate,
-            # Crop
-            "active_crop_type": CropType.FALLOW,
-            "crop_age_months": 0,
-            "planting_month": 0,  # month when current crop was planted
-            # Soil
-            "soil_nitrogen": cfg.initial_soil_nitrogen,
-            # Water
-            "water_level": 0.0,
-            # Finance
-            "cash": cfg.initial_cash,
-            "debt": 0.0,
-            "has_active_loan": False,
-            "loan_interest_rate": 0.0,
-            # Storage
-            "stored_crop_type": CropType.FALLOW,
-            "stored_amount": 0.0,
-            "stored_age_months": 0,
-            # Per-step flags
-            "irrigated": False,
-            "fertilized": False,
-            # Inflated values (mutated by inflation each year)
-            "inflated_seed_costs": list(cfg.seed_costs),
-            "inflated_cost_irrigate": cfg.cost_irrigate,
-            "inflated_cost_fertilize": cfg.cost_fertilize,
-            "inflated_loan_chunk": cfg.loan_chunk,
-            "inflated_base_land_price": cfg.base_land_price,
-            "inflated_monthly_fixed_cost": cfg.monthly_fixed_cost,
-            "inflated_base_market_prices": list(cfg.base_market_prices),
+            "month": month, "step": step, "month_count": 0,
+            "expected_rainfall": rainfall, "prices": prices, "interest_rate": interest_rate,
+            "active_crop_type": CropType.FALLOW, "crop_age_months": 0, "planting_month": 0,
+            "soil_nitrogen": cfg.initial_soil_nitrogen, "water_level": 0.0,
+            "cash": cfg.initial_cash, "debt": 0.0, "has_active_loan": False, "loan_interest_rate": 0.0,
+            "stored_crop_type": CropType.FALLOW, "stored_amount": 0.0, "stored_age_months": 0,
+            "irrigated": False, "fertilized": False,
         }
 
         # Compute initial net worth for reward tracking
@@ -148,7 +120,6 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             has_active_loan=False,
             loan_interest_rate=0.0,
             current_month_count=0,
-            current_year=1,
             task_id=self.task_id,
         )
 
@@ -190,9 +161,8 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s["irrigated"] = False
         s["fertilized"] = False
 
-        if action_id == ActionType.WAIT:
-            messages.append("You waited this month.")
-            # Month advance happens in step 4 below
+        if action_id == ActionType.NO_OP:
+            messages.append("No-op.")
 
         elif action_id in (ActionType.PLANT_CORN, ActionType.PLANT_WHEAT, ActionType.PLANT_CHICKPEA):
             penalty, msg = self._do_plant(s, action_id)
@@ -226,11 +196,17 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             penalty, msg = self._do_repay_loan(s)
             messages.append(msg)
 
+        elif action_id == ActionType.POST_FORUM:
+            messages.append("Posted to forum.")
+
         # ── 2. Increment step counter ──────────────────────────────
         s["step"] += 1
 
-        # ── 3. If Wait: advance monthly dynamics ──────────────────
-        if action_id == ActionType.WAIT:
+        # ── 3. If No-Op (Wait): advance monthly dynamics ─────────
+        #    In multi-agent mode, month advance is handled by the
+        #    MultiAgentCroprlEnv wrapper. This path is for backward
+        #    compat with the single-agent CroprlEnvironment.
+        if action_id == ActionType.NO_OP:
             month_messages = self._advance_month(s, cfg)
             messages.extend(month_messages)
 
@@ -278,7 +254,6 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         self._state.has_active_loan = s["has_active_loan"]
         self._state.loan_interest_rate = s["loan_interest_rate"]
         self._state.current_month_count = s["month_count"]
-        self._state.current_year = s["year"]
 
         return self._build_observation(
             yield_potential=yield_potential,
@@ -304,7 +279,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         """Execute a plant action. Returns (penalty, message)."""
         cfg = self.config
         crop_idx = action_id  # action 1→crop 1, 2→2, 3→3
-        seed_cost = s["inflated_seed_costs"][crop_idx]
+        seed_cost = cfg.seed_costs[crop_idx]
 
         if s["active_crop_type"] != CropType.FALLOW:
             return cfg.invalid_action_penalty, (
@@ -329,7 +304,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
     def _do_irrigate(self, s: dict) -> tuple[float, str]:
         """Execute irrigate action. Returns (penalty, message)."""
         cfg = self.config
-        irrigate_cost = s["inflated_cost_irrigate"]
+        irrigate_cost = cfg.cost_irrigate
 
         if s["active_crop_type"] == CropType.FALLOW:
             return cfg.invalid_action_penalty, (
@@ -358,7 +333,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
     def _do_fertilize(self, s: dict) -> tuple[float, str]:
         """Execute fertilize action. Returns (penalty, message)."""
         cfg = self.config
-        fert_cost = s["inflated_cost_fertilize"]
+        fert_cost = cfg.cost_fertilize
 
         if s["cash"] < fert_cost:
             return cfg.invalid_action_penalty, (
@@ -492,7 +467,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
                 "Repay it first before taking another."
             )
 
-        loan_amount = s["inflated_loan_chunk"]
+        loan_amount = cfg.loan_chunk
         s["cash"] += loan_amount
         s["debt"] += loan_amount
         s["has_active_loan"] = True
@@ -555,16 +530,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s["month"] = (s["month"] % 12) + 1
         s["month_count"] += 1
 
-        # 2. Inflation check (when month wraps to January)
-        if s["month"] == 1 and old_month == 12:
-            self._apply_inflation(s, cfg)
-            s["year"] += 1
-            messages.append(
-                f"Year {s['year']} begins. "
-                f"Inflation applied ({cfg.inflation_rate * 100:.0f}%)."
-            )
-
-        # 3. Realise rainfall
+        # 2. Realise rainfall
         realised = realise_rainfall(
             s["expected_rainfall"],
             cfg.weather_sigma_realisation,
@@ -614,7 +580,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             s["debt"] *= 1.0 + monthly_rate
 
         # 9. Monthly fixed cost
-        s["cash"] -= s["inflated_monthly_fixed_cost"]
+        s["cash"] -= cfg.monthly_fixed_cost
 
         # [Future] Storage cost
         if cfg.enable_storage_cost and s["stored_amount"] > 0:
@@ -627,7 +593,6 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s["prices"] = generate_market_prices(
             s["month"], cfg, self._rng,
             prev_prices=prev_prices,
-            effective_base_prices=tuple(s["inflated_base_market_prices"]),
         )
 
         # 11. Update interest rate
@@ -643,18 +608,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
 
         return messages
 
-    def _apply_inflation(self, s: dict, cfg: EnvConfig) -> None:
-        """Apply compounding inflation to all inflatable values."""
-        factor = 1.0 + cfg.inflation_rate
-        s["inflated_seed_costs"] = [c * factor for c in s["inflated_seed_costs"]]
-        s["inflated_cost_irrigate"] *= factor
-        s["inflated_cost_fertilize"] *= factor
-        s["inflated_loan_chunk"] *= factor
-        s["inflated_base_land_price"] *= factor
-        s["inflated_monthly_fixed_cost"] *= factor
-        s["inflated_base_market_prices"] = [
-            p * factor for p in s["inflated_base_market_prices"]
-        ]
+    # Inflation removed.
 
     # ──────────────────────────────────────────────────────────────
     # Net worth & terminal value
@@ -673,7 +627,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s = self._internal
         cfg = self.config
 
-        land_value = s["inflated_base_land_price"] * s["soil_nitrogen"]
+        land_value = cfg.base_land_price * s["soil_nitrogen"]
 
         stored_value = 0.0
         if s["stored_amount"] > 0 and s["stored_crop_type"] != CropType.FALLOW:
@@ -720,7 +674,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         s = self._internal
         cfg = self.config
 
-        land_price = s["inflated_base_land_price"] * s["soil_nitrogen"]
+        land_price = cfg.base_land_price * s["soil_nitrogen"]
 
         obs_dict = {
             "current_month": s["month"],
@@ -738,11 +692,11 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
             "market_price_crop_1": s["prices"][0],
             "market_price_crop_2": s["prices"][1],
             "market_price_crop_3": s["prices"][2],
-            "cost_seed_1": s["inflated_seed_costs"][1],
-            "cost_seed_2": s["inflated_seed_costs"][2],
-            "cost_seed_3": s["inflated_seed_costs"][3],
-            "cost_irrigate": s["inflated_cost_irrigate"],
-            "cost_fertilize": s["inflated_cost_fertilize"],
+            "cost_seed_1": cfg.seed_costs[1],
+            "cost_seed_2": cfg.seed_costs[2],
+            "cost_seed_3": cfg.seed_costs[3],
+            "cost_irrigate": cfg.cost_irrigate,
+            "cost_fertilize": cfg.cost_fertilize,
             "stored_crop_type": s["stored_crop_type"],
             "stored_amount": s["stored_amount"],
             "stored_age_months": s["stored_age_months"],
@@ -754,7 +708,7 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         if cfg.text_mode:
             valid_actions = self._get_valid_actions()
             # Build a copy with extra display-only fields for the text formatter
-            text_dict = {**obs_dict, "monthly_fixed_cost": s["inflated_monthly_fixed_cost"]}
+            text_dict = {**obs_dict, "monthly_fixed_cost": cfg.monthly_fixed_cost}
             text_summary = format_text_observation(
                 text_dict, cfg, s["has_active_loan"], valid_actions
             )
@@ -775,16 +729,16 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         # Plant actions (1, 2, 3)
         if s["active_crop_type"] == CropType.FALLOW:
             for crop_idx in (CropType.CORN, CropType.WHEAT, CropType.CHICKPEA):
-                if s["cash"] >= s["inflated_seed_costs"][crop_idx]:
+                if s["cash"] >= cfg.seed_costs[crop_idx]:
                     valid.append(crop_idx)
 
         # Irrigate (4)
         if (s["active_crop_type"] != CropType.FALLOW
-                and s["cash"] >= s["inflated_cost_irrigate"]):
+                and s["cash"] >= cfg.cost_irrigate):
             valid.append(ActionType.IRRIGATE)
 
         # Fertilize (5)
-        if s["cash"] >= s["inflated_cost_fertilize"]:
+        if s["cash"] >= cfg.cost_fertilize:
             valid.append(ActionType.FERTILIZE)
 
         # Harvest & Store (6), Harvest & Sell (7)

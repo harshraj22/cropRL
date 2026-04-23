@@ -9,6 +9,7 @@
 from .client import CroprlEnv
 from .enums import ActionType, CropType, Season
 from .models import CroprlAction, CroprlObservation
+from .multi_env import MultiAgentCroprlEnv
 
 __all__ = [
     "ActionType",
@@ -16,5 +17,6 @@ __all__ = [
     "CroprlAction",
     "CroprlEnv",
     "CroprlObservation",
+    "MultiAgentCroprlEnv",
     "Season",
 ]

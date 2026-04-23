@@ -29,7 +29,7 @@ class CropType(IntEnum):
 class ActionType(IntEnum):
     """All discrete actions the agent can take."""
 
-    WAIT = 0
+    NO_OP = 0
     PLANT_CORN = 1
     PLANT_WHEAT = 2
     PLANT_CHICKPEA = 3
@@ -40,6 +40,10 @@ class ActionType(IntEnum):
     SELL_INVENTORY = 8
     TAKE_LOAN = 9
     REPAY_LOAN = 10
+    POST_FORUM = 11
+
+# Backward-compatible alias
+ActionType.WAIT = ActionType.NO_OP
 
 
 # ── Month ↔ Season mapping ────────────────────────────────────────
