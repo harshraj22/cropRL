@@ -73,9 +73,13 @@ def train(args):
     
     # --- 3. Load Dataset ---
     print("Loading dataset...")
-    # For a real pipeline, you would load from disk:
-    # dataset = load_dataset("json", data_files="data.jsonl", split="train")
-    dataset = create_dummy_dataset()
+    if args.data_path:
+        from datasets import load_dataset
+        print(f"Loading dataset from {args.data_path}")
+        dataset = load_dataset("json", data_files=args.data_path, split="train")
+    else:
+        print("No --data_path provided. Using dummy dataset.")
+        dataset = create_dummy_dataset()
     
     # --- 4. Configure SFTTrainer ---
     print("Configuring SFTTrainer...")
@@ -139,6 +143,7 @@ if __name__ == "__main__":
     # Output
     parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N steps")
     parser.add_argument("--output_dir", type=str, default="./train/sft_checkpoints", help="Output directory")
+    parser.add_argument("--data_path", type=str, default=None, help="Path to SFT JSONL dataset. Uses dummy if not provided.")
     
     args = parser.parse_args()
     train(args)
