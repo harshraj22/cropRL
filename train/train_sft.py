@@ -91,8 +91,6 @@ def train(args):
         logging_steps=1,
         save_steps=args.save_every,
         max_seq_length=args.max_seq_length,
-        # SFTTrainer automatically applies the tokenizer's chat_template if dataset has a "messages" column
-        dataset_text_field="messages", 
         report_to="wandb"
     )
     
