@@ -131,7 +131,13 @@ def train(args):
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
         n_agents = envs[0]._ma_cfg.num_agents
         
+        # Curriculum Learning: Expanding horizon starts small to learn short-term consequences first
+        current_max_months = min(60, 10 + iteration * 2)
+        print(f"Curriculum Horizon: {current_max_months} months")
+        
         for env_idx, env in enumerate(envs):
+            env._env_cfg.max_months = current_max_months
+            
             # Unique seed per iteration and environment to prevent overfitting to a single weather/market trajectory
             env_seed = (iteration * args.group_size) + env_idx
             env.reset(seed=env_seed)
@@ -339,6 +345,9 @@ def train(args):
         wandb.log({
             "iteration": iteration,
             "mean_return": mean_return,
+            "mean_return_per_month": mean_return / max(1, current_max_months),
+            "current_horizon": current_max_months,
+            "dataset_size": len(dataset),
             "std_return": std_return,
             "loss": avg_loss,
             "kl_divergence": avg_kl,
