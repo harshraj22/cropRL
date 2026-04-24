@@ -379,7 +379,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_GRPO_Run_1", help="WandB run name")
-    parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
+    parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")
     parser.add_argument("--group_size", type=int, default=8, help="Number of trajectories to collect per iteration (G)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Batch size equivalent via grad accumulation")
@@ -392,7 +392,7 @@ if __name__ == "__main__":
     parser.add_argument("--beta", type=float, default=0.01, help="KL penalty coefficient")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--max_new_tokens", type=int, default=15, help="Max tokens per action generation")
+    parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens per action generation")
     parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N iterations")
     parser.add_argument("--output_dir", type=str, default="./train/checkpoints", help="Output directory for checkpoints")
     

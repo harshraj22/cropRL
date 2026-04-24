@@ -387,7 +387,7 @@ def run_episode(client: OpenAI, task_id: str):
 def main():
     global MODEL_NAME
     parser = argparse.ArgumentParser(description="Run CropRL inference")
-    parser.add_argument("--task", type=str, default="easy", help="Task ID to run")
+    parser.add_argument("--task", type=str, default="easy_2agent", help="Task ID to run")
     parser.add_argument("--model", type=str, default=MODEL_NAME, help="Model name")
     args = parser.parse_args()
     

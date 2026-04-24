@@ -35,7 +35,7 @@ def main(args):
     
     # Run episodes
     total_samples = 0
-    with open(output_path, "a") as f:
+    with open(output_path, "w") as f:
         for ep in tqdm(range(1, args.num_episodes + 1), desc="Generating SFT Data"):
             env = create_env_for_task(args.task, text_mode=True)
             # Use a different seed per episode
@@ -143,7 +143,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B-Instruct", help="HuggingFace Teacher Model")
-    parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
+    parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_episodes", type=int, default=10, help="Number of full episodes to run")
     parser.add_argument("--output_file", type=str, default="dataset/sft_data.jsonl", help="Output JSONL path")
     parser.add_argument("--seed_base", type=int, default=1000, help="Base seed for environment")
