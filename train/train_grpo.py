@@ -41,6 +41,42 @@ def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     masked_logprobs = action_logprobs * gen_mask
     return masked_logprobs.sum(dim=-1)
 
+def get_action_prefix_fn(tokenizer, prompt_length):
+    """Creates a prefix_allowed_tokens_fn to constrain generation to valid action formats."""
+    digit_tokens = {str(i): tokenizer.encode(str(i), add_special_tokens=False)[0] for i in range(10)}
+    space_token = tokenizer.encode(" ", add_special_tokens=False)[0]
+    
+    token_1 = digit_tokens["1"]
+    tokens_0_to_4 = [digit_tokens[str(i)] for i in range(5)]
+    all_digits = list(digit_tokens.values())
+    
+    def prefix_allowed_tokens_fn(batch_id, input_ids):
+        gen_tokens = input_ids[prompt_length:]
+        if len(gen_tokens) == 0:
+            return all_digits
+        elif len(gen_tokens) == 1:
+            first = gen_tokens[0].item()
+            if first == token_1:
+                return tokens_0_to_4 + [space_token, tokenizer.eos_token_id]
+            else:
+                return [space_token, tokenizer.eos_token_id]
+        elif len(gen_tokens) == 2:
+            first = gen_tokens[0].item()
+            second = gen_tokens[1].item()
+            if first == token_1 and second == token_1: # "11"
+                return [space_token] # Force space after "11"
+            else:
+                return [tokenizer.eos_token_id]
+        else:
+            first = gen_tokens[0].item()
+            if len(gen_tokens) > 1:
+                second = gen_tokens[1].item()
+                if first == token_1 and second == token_1:
+                    return list(range(tokenizer.vocab_size))
+            return [tokenizer.eos_token_id]
+            
+    return prefix_allowed_tokens_fn
+
 def train(args):
     # Initialize WandB
     wandb.init(project="CropRL-GRPO", name=args.run_name, config=vars(args))
@@ -95,8 +131,10 @@ def train(args):
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
         n_agents = envs[0]._ma_cfg.num_agents
         
-        for env in envs:
-            env.reset()
+        for env_idx, env in enumerate(envs):
+            # Unique seed per iteration and environment to prevent overfitting to a single weather/market trajectory
+            env_seed = (iteration * args.group_size) + env_idx
+            env.reset(seed=env_seed)
         
         # Get initial net worths for reward shaping (per env, per agent)
         prev_net_worths = [[env._farms[a].compute_net_worth() for a in range(n_agents)] for env in envs]
@@ -106,7 +144,8 @@ def train(args):
         trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
         
         step_count = 0
-        with torch.no_grad(), tqdm(total=60, desc="Rollout Phase", leave=False) as pbar:
+        total_env_steps = envs[0]._env_cfg.max_months * envs[0]._ma_cfg.action_slots_per_month
+        with torch.no_grad(), tqdm(total=total_env_steps, desc="Rollout Phase", leave=False) as pbar:
             while active_envs:
                 step_count += 1
                 # Use the rotating turn order from the first active env (valid proxy for batch)
@@ -154,6 +193,8 @@ def train(args):
                         
                     inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
                     
+                    prefix_fn = get_action_prefix_fn(tokenizer, inputs.input_ids.shape[1])
+                    
                     outputs = model.generate(
                         **inputs,
                         max_new_tokens=args.max_new_tokens,
@@ -161,6 +202,7 @@ def train(args):
                         temperature=args.temperature,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
+                        prefix_allowed_tokens_fn=prefix_fn,
                     )
                     
                     gen_seqs = outputs[:, inputs.input_ids.shape[1]:]
@@ -320,7 +362,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Hugging Face model path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_GRPO_Run_1", help="WandB run name")
     parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")

@@ -32,6 +32,7 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "ollama")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma4:e4b")
 TEMPERATURE = 0.0  # Set to 0 to prevent erratic thinking tokens
 MAX_TOKENS = 50  # Increased to prevent the model from rambling or thinking, but allow messages
+SHAPE_REWARDS = os.getenv("SHAPE_REWARDS", "true").lower() == "true"
 
 SYSTEM_PROMPT = """\
 You are an expert farm manager AI. You manage a small Indian farm over 60 months.
@@ -221,6 +222,8 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
     log_start(task=task_id, env="croprl", model=MODEL_NAME)
     max_steps = env._env_cfg.max_steps
     trajectory: list = []
+    
+    prev_net_worth = env._farms[0].compute_net_worth() if SHAPE_REWARDS else 0.0
 
     try:
         for step in range(1, max_steps + 1):
@@ -239,7 +242,13 @@ def run_single_agent_episode(client: OpenAI, task_id: str):
             action = MultiAgentAction(action_id=action_id, agent_id=0, forum_message=forum_message)
             result_obs = env.step(action)
 
-            reward = result_obs.reward or 0.0
+            if SHAPE_REWARDS:
+                current_net_worth = env._farms[0].compute_net_worth()
+                reward = current_net_worth - prev_net_worth
+                prev_net_worth = current_net_worth
+            else:
+                reward = result_obs.reward or 0.0
+                
             done = result_obs.done
 
             rewards.append(reward)
@@ -296,6 +305,8 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
     success = False
 
     log_start(task=task_id, env="croprl_multi_agent", model=MODEL_NAME)
+    
+    prev_net_worths = {i: env._farms[i].compute_net_worth() for i in range(n)} if SHAPE_REWARDS else {}
 
     try:
         while len(done_agents) < n and total_steps < max_steps:
@@ -316,7 +327,13 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
                 action = MultiAgentAction(action_id=action_id, agent_id=agent_id, forum_message=forum_message)
                 new_obs = env.step(action)
 
-                reward = new_obs.reward or 0.0
+                if SHAPE_REWARDS:
+                    current_net_worth = env._farms[agent_id].compute_net_worth()
+                    reward = current_net_worth - prev_net_worths[agent_id]
+                    prev_net_worths[agent_id] = current_net_worth
+                else:
+                    reward = new_obs.reward or 0.0
+                    
                 total_steps += 1
 
                 log_step(step=total_steps, action=f"A{agent_id}:{action_name}", reward=reward, done=new_obs.done, error=None)
