@@ -44,6 +44,8 @@ def main(args):
             n = env._ma_cfg.num_agents
             max_steps = env._env_cfg.max_steps * n
             
+            prev_net_worths = {i: env._farms[i].compute_net_worth() for i in range(n)}
+            
             done_agents = set()
             histories = {i: [] for i in range(n)}
             agent_rewards = {i: 0.0 for i in range(n)}
@@ -117,7 +119,10 @@ def main(args):
                     action = MultiAgentAction(action_id=action_id, agent_id=agent_id, forum_message=forum_message)
                     new_obs = env.step(action)
                     
-                    reward = new_obs.reward or 0.0
+                    current_net_worth = env._farms[agent_id].compute_net_worth()
+                    reward = current_net_worth - prev_net_worths[agent_id]
+                    prev_net_worths[agent_id] = current_net_worth
+                    
                     total_steps += 1
                     
                     histories[agent_id].append(f"Step {getattr(new_obs, 'current_step', total_steps)}: Selected '{action_name}' -> Reward {reward:+.2f}")

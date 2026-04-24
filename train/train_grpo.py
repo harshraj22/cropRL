@@ -147,6 +147,7 @@ def train(args):
         
         active_envs = list(range(args.group_size))
         done_agents = {i: set() for i in range(args.group_size)}
+        histories = {i: {a: [] for a in range(n_agents)} for i in range(args.group_size)}
         trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
         
         step_count = 0
@@ -179,6 +180,8 @@ def train(args):
                             continue
                             
                         user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
+                        history_block = "\n".join(histories[env_idx][agent_id][-12:]) if histories[env_idx][agent_id] else "None"
+                        user_msg += f"\n\nRecent History:\n{history_block}"
 
                         messages = [
                             {"role": "system", "content": get_agent_system_prompt(agent_id, n_agents)},
@@ -232,6 +235,9 @@ def train(args):
                         current_net_worth = envs[env_idx]._farms[agent_id].compute_net_worth()
                         reward = current_net_worth - prev_net_worths[env_idx][agent_id]
                         prev_net_worths[env_idx][agent_id] = current_net_worth
+                        
+                        action_name = envs[env_idx]._env_cfg.action_names[act_id] if act_id < len(envs[env_idx]._env_cfg.action_names) else f"Action {act_id}"
+                        histories[env_idx][agent_id].append(f"Step {getattr(next_obs, 'current_step', step_count)}: Selected '{action_name}' -> Reward {reward:+.2f}")
                         
                         trajectories[env_idx][agent_id].append({
                             "input_ids": full_seqs[idx].cpu(),
