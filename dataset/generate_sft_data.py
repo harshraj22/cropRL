@@ -20,7 +20,16 @@ def main(args):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading Teacher Model: {args.model_name} on {device}")
+    
+    print("="*50)
+    print("SFT DATA GENERATION CONFIGURATION")
+    print(f"Task:               {args.task}")
+    print(f"Num Episodes:       {args.num_episodes}")
+    print(f"Teacher Model:      {args.model_name}")
+    print(f"Model Source:       HuggingFace")
+    print(f"Output File:        {output_path}")
+    print(f"Device:             {device}")
+    print("="*50)
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
@@ -132,13 +141,23 @@ def main(args):
                         done_agents.add(agent_id)
             
             # End of episode: write buffered data with total_return
+            ep_returns = []
             for agent_id, data_points in episode_buffer.items():
                 total_return = agent_rewards[agent_id]
+                ep_returns.append(total_return)
                 for dp in data_points:
                     dp["metadata"]["total_return"] = total_return
                     f.write(json.dumps(dp) + "\n")
                     total_samples += 1
             f.flush()
+            tqdm.write(f"Episode {ep} finished | Steps: {total_steps} | Returns: {[round(r, 2) for r in ep_returns]}")
+            
+    print("="*50)
+    print("DATA GENERATION COMPLETE")
+    print(f"Total Samples Generated: {total_samples}")
+    print(f"Total Episodes Run:      {args.num_episodes}")
+    print(f"File Saved To:           {output_path.resolve()}")
+    print("="*50)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

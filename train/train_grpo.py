@@ -78,6 +78,17 @@ def get_action_prefix_fn(tokenizer, prompt_length):
     return prefix_allowed_tokens_fn
 
 def train(args):
+    print("="*50)
+    print("GRPO TRAINING CONFIGURATION")
+    print(f"Model Taken From:    {args.model_name}")
+    import os
+    model_source = "Local Checkpoint" if os.path.isdir(args.model_name) else "HuggingFace Hub"
+    print(f"Model Source:        {model_source}")
+    print(f"Task:                {args.task}")
+    print(f"Group Size (G):      {args.group_size}")
+    print(f"LoRA Targets:        ['q_proj', 'v_proj']")
+    print("="*50)
+    
     # Initialize WandB
     wandb.init(project="CropRL-GRPO", name=args.run_name, config=vars(args))
     

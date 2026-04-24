@@ -41,6 +41,16 @@ def create_dummy_dataset():
 
 
 def train(args):
+    print("="*50)
+    print("SFT TRAINING CONFIGURATION")
+    print(f"Model Taken From:    {args.model_name}")
+    import os
+    model_source = "Local Checkpoint" if os.path.isdir(args.model_name) else "HuggingFace Hub"
+    print(f"Model Source:        {model_source}")
+    print(f"Data Taken From:     {args.data_path if args.data_path else 'Dummy Dataset'}")
+    print(f"LoRA Targets:        ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']")
+    print("="*50)
+    
     # Initialize WandB
     wandb.init(project="CropRL-SFT", name=args.run_name, config=vars(args))
     
