@@ -8,16 +8,16 @@ class SaveToStorageCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         epoch = int(state.epoch)
-        
+
         # Sync to HuggingFace bucket using subprocess
         try:
             print(f"Syncing epoch {epoch} checkpoint to HuggingFace bucket...")
             subprocess.run(
                 [
-                    "hf", "buckets", "sync", 
+                    "hf", "buckets", "sync",
                     "--exclude", ".*",
                     self.output_dir,
-                    "hf://buckets/harshraj22/croprl-workspace/sft_checkpoints/colab"
+                    "hf://buckets/Utkarshp1/croprl-workspace/sft_checkpoints/colab"
                 ],
                 check=True,
                 capture_output=True,
