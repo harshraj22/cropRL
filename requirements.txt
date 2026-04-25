@@ -13,5 +13,6 @@ transformers>=4.40.0
 peft>=0.10.0
 accelerate>=0.29.0
 wandb>=0.16.0
-trl>=0.9.0
+trl==0.12.0
 datasets>=2.14.0
+bitsandbytes>=0.41.0
