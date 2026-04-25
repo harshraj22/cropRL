@@ -164,7 +164,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.6-35B-A3B", help="HuggingFace Teacher Model")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.6-27B", help="HuggingFace Teacher Model")
     parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of full episodes to run")
     parser.add_argument("--output_file", type=str, default="dataset/sft_data.jsonl", help="Output JSONL path")
