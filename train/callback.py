@@ -17,7 +17,7 @@ class SaveToStorageCallback(TrainerCallback):
                     "hf", "buckets", "sync", 
                     "--exclude", ".*",
                     self.output_dir,
-                    "hf://buckets/harshraj22/croprl-workspace/sft_checkpoints"
+                    "hf://buckets/harshraj22/croprl-workspace/sft_checkpoints/colab"
                 ],
                 check=True,
                 capture_output=True,
