@@ -12,6 +12,9 @@ from callback import SaveToStorageCallback
 
 import wandb
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True  # falls back to eager on failure
+
 # Ensure the root directory is on the path so cropRL module works
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -110,7 +113,9 @@ def train(args):
         max_seq_length=args.max_seq_length,
         bf16=torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
         optim="adamw_8bit",                     
-        callbacks=[SaveToStorageCallback(output_dir=args.output_dir)]
+        callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
+        torch_compile=True,              
+        torch_compile_backend="inductor"
     )
 
     def formatting_func(example):
