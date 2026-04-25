@@ -78,6 +78,17 @@ def get_action_prefix_fn(tokenizer, prompt_length):
     return prefix_allowed_tokens_fn
 
 def train(args):
+    print("="*50)
+    print("GRPO TRAINING CONFIGURATION")
+    print(f"Model Taken From:    {args.model_name}")
+    import os
+    model_source = "Local Checkpoint" if os.path.isdir(args.model_name) else "HuggingFace Hub"
+    print(f"Model Source:        {model_source}")
+    print(f"Task:                {args.task}")
+    print(f"Group Size (G):      {args.group_size}")
+    print(f"LoRA Targets:        ['q_proj', 'v_proj']")
+    print("="*50)
+    
     # Initialize WandB
     wandb.init(project="CropRL-GRPO", name=args.run_name, config=vars(args))
     
@@ -131,7 +142,13 @@ def train(args):
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
         n_agents = envs[0]._ma_cfg.num_agents
         
+        # Curriculum Learning: Expanding horizon starts small to learn short-term consequences first
+        current_max_months = min(60, 10 + iteration * 2)
+        print(f"Curriculum Horizon: {current_max_months} months")
+        
         for env_idx, env in enumerate(envs):
+            env._env_cfg.max_months = current_max_months
+            
             # Unique seed per iteration and environment to prevent overfitting to a single weather/market trajectory
             env_seed = (iteration * args.group_size) + env_idx
             env.reset(seed=env_seed)
@@ -141,6 +158,7 @@ def train(args):
         
         active_envs = list(range(args.group_size))
         done_agents = {i: set() for i in range(args.group_size)}
+        histories = {i: {a: [] for a in range(n_agents)} for i in range(args.group_size)}
         trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
         
         step_count = 0
@@ -173,6 +191,8 @@ def train(args):
                             continue
                             
                         user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
+                        history_block = "\n".join(histories[env_idx][agent_id][-12:]) if histories[env_idx][agent_id] else "None"
+                        user_msg += f"\n\nRecent History:\n{history_block}"
 
                         messages = [
                             {"role": "system", "content": get_agent_system_prompt(agent_id, n_agents)},
@@ -181,7 +201,8 @@ def train(args):
                         prompt = tokenizer.apply_chat_template(
                             messages,
                             add_generation_prompt=True,
-                            tokenize=False
+                            tokenize=False,
+                            enable_thinking=False
                         )
 
                         prompts.append(prompt)
@@ -200,6 +221,9 @@ def train(args):
                         max_new_tokens=args.max_new_tokens,
                         do_sample=True,
                         temperature=args.temperature,
+                        top_p=0.8,
+                        top_k=20,
+                        min_p=0,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         prefix_allowed_tokens_fn=prefix_fn,
@@ -226,6 +250,9 @@ def train(args):
                         current_net_worth = envs[env_idx]._farms[agent_id].compute_net_worth()
                         reward = current_net_worth - prev_net_worths[env_idx][agent_id]
                         prev_net_worths[env_idx][agent_id] = current_net_worth
+                        
+                        action_name = envs[env_idx]._env_cfg.action_names[act_id] if act_id < len(envs[env_idx]._env_cfg.action_names) else f"Action {act_id}"
+                        histories[env_idx][agent_id].append(f"Step {getattr(next_obs, 'current_step', step_count)}: Selected '{action_name}' -> Reward {reward:+.2f}")
                         
                         trajectories[env_idx][agent_id].append({
                             "input_ids": full_seqs[idx].cpu(),
@@ -339,6 +366,9 @@ def train(args):
         wandb.log({
             "iteration": iteration,
             "mean_return": mean_return,
+            "mean_return_per_month": mean_return / max(1, current_max_months),
+            "current_horizon": current_max_months,
+            "dataset_size": len(dataset),
             "std_return": std_return,
             "loss": avg_loss,
             "kl_divergence": avg_kl,
@@ -362,9 +392,9 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_GRPO_Run_1", help="WandB run name")
-    parser.add_argument("--task", type=str, default="easy", help="CropRL task identifier")
+    parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")
     parser.add_argument("--group_size", type=int, default=8, help="Number of trajectories to collect per iteration (G)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Batch size equivalent via grad accumulation")
@@ -376,9 +406,9 @@ if __name__ == "__main__":
     parser.add_argument("--clip_eps", type=float, default=0.2, help="PPO clipping parameter")
     parser.add_argument("--beta", type=float, default=0.01, help="KL penalty coefficient")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--max_new_tokens", type=int, default=15, help="Max tokens per action generation")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N iterations")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens per action generation")
+    parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N iterations")
     parser.add_argument("--output_dir", type=str, default="./train/checkpoints", help="Output directory for checkpoints")
     
     args = parser.parse_args()
