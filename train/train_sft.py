@@ -95,6 +95,11 @@ def train(args):
         print("No --data_path provided.")
         raise ValueError("Please provide a path to the dataset.")
     
+    split = dataset.train_test_split(test_size=args.val_split, seed=42)
+    train_dataset = split["train"]
+    eval_dataset  = split["test"]
+    print(f"Train: {len(train_dataset)} samples, Val: {len(eval_dataset)} samples")
+
     # --- 4. Configure SFTTrainer ---
     print("Configuring SFTTrainer...")
     training_args = SFTConfig(
@@ -116,7 +121,11 @@ def train(args):
         optim="adamw_8bit",                     
         torch_compile=True,              
         torch_compile_backend="inductor",
-        dataloader_drop_last=True
+        dataloader_drop_last=True,
+        save_strategy="epoch",       
+        eval_strategy="epoch",       
+        load_best_model_at_end=True, 
+        metric_for_best_model="eval_loss",
     )
 
     def formatting_func(example):
@@ -129,7 +138,8 @@ def train(args):
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,  
+        eval_dataset=eval_dataset,    
         processing_class=tokenizer,
         formatting_func=formatting_func,
         callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
@@ -155,6 +165,8 @@ if __name__ == "__main__":
     # General & Architecture (matching GRPO)
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_SFT_Run_1", help="WandB run name")
+    
+    parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (default: 10%)")
     
     # Training Hyperparameters
     parser.add_argument("--num_epochs", type=int, default=30, help="Total training epochs")
