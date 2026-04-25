@@ -124,6 +124,7 @@ def train(args):
         save_strategy="epoch",
         eval_strategy="epoch",
         load_best_model_at_end=True,
+        max_seq_length=args.max_seq_length,
         metric_for_best_model="eval_loss",
     )
 
@@ -141,7 +142,6 @@ def train(args):
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         formatting_func=formatting_func,
-        max_seq_length=args.max_seq_length,
         callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
     )
 
