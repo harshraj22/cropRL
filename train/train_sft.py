@@ -96,7 +96,7 @@ def train(args):
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=1,          # 👈 was 8, drop to 1
+        per_device_train_batch_size=args.batch_size,          # 👈 was 8, drop to 1
         gradient_accumulation_steps=16,         # 👈 bump up to compensate (effective batch = 16)
         gradient_checkpointing=True,            # 👈 add this — trades compute for memory
         learning_rate=args.learning_rate,
