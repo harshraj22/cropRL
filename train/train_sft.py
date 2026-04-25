@@ -8,8 +8,12 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
+from callback import SaveToStorageCallback
 
 import wandb
+
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True  # falls back to eager on failure
 
 # Ensure the root directory is on the path so cropRL module works
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,7 +43,6 @@ def create_dummy_dataset():
     
     return Dataset.from_list([sample])
 
-
 def train(args):
     print("="*50)
     print("SFT TRAINING CONFIGURATION")
@@ -62,6 +65,7 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right" # Crucial for SFT causal LM training
         
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -88,31 +92,47 @@ def train(args):
         print(f"Loading dataset from {args.data_path}")
         dataset = load_dataset("json", data_files=args.data_path, split="train")
     else:
-        print("No --data_path provided. Using dummy dataset.")
-        dataset = create_dummy_dataset()
+        print("No --data_path provided.")
+        raise ValueError("Please provide a path to the dataset.")
     
     # --- 4. Configure SFTTrainer ---
     print("Configuring SFTTrainer...")
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        per_device_train_batch_size=args.batch_size,         
+        gradient_accumulation_steps=16,         
+        gradient_checkpointing=True,            
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,
         logging_steps=1,
         save_steps=args.save_every,
+        report_to="wandb",
         max_seq_length=args.max_seq_length,
-        report_to="wandb"
+        bf16=False,#torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
+        fp16=True,
+        optim="adamw_8bit",                     
+        torch_compile=True,              
+        torch_compile_backend="inductor",
+        dataloader_drop_last=True
     )
+
+    def formatting_func(example):
+        return tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False  # False for SFT — we want to train on the full convo incl. assistant turn
+        )
     
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
+        formatting_func=formatting_func,
+        callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
     )
     
     # --- 5. Execute Training ---
@@ -137,7 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="CropRL_SFT_Run_1", help="WandB run name")
     
     # Training Hyperparameters
-    parser.add_argument("--num_epochs", type=int, default=3, help="Total training epochs")
+    parser.add_argument("--num_epochs", type=int, default=30, help="Total training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Grad accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for LoRA")
@@ -151,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     
     # Output
-    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N steps")
+    parser.add_argument("--save_every", type=int, default=3, help="Save checkpoint every N steps")
     parser.add_argument("--output_dir", type=str, default="./train/sft_checkpoints", help="Output directory")
     parser.add_argument("--data_path", type=str, default=None, help="Path to SFT JSONL dataset. Uses dummy if not provided.")
     
