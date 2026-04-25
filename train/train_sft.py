@@ -92,8 +92,8 @@ def train(args):
         print(f"Loading dataset from {args.data_path}")
         dataset = load_dataset("json", data_files=args.data_path, split="train")
     else:
-        print("No --data_path provided. Using dummy dataset.")
-        dataset = create_dummy_dataset()
+        print("No --data_path provided.")
+        raise ValueError("Please provide a path to the dataset.")
     
     # --- 4. Configure SFTTrainer ---
     print("Configuring SFTTrainer...")
@@ -112,6 +112,7 @@ def train(args):
         report_to="wandb",
         max_seq_length=args.max_seq_length,
         bf16=False,#torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
+        fp16=True,
         optim="adamw_8bit",                     
         torch_compile=True,              
         torch_compile_backend="inductor",

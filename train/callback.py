@@ -6,7 +6,7 @@ class SaveToStorageCallback(TrainerCallback):
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
 
-    def on_epoch_end(self, args, state, control, **kwargs):
+    def on_epoch_begin(self, args, state, control, **kwargs):
         epoch = int(state.epoch)
         
         # Sync to HuggingFace bucket using subprocess
