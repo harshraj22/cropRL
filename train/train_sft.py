@@ -115,7 +115,6 @@ def train(args):
         logging_steps=1,
         save_steps=args.save_every,
         report_to="wandb",
-        max_seq_length=args.max_seq_length,
         bf16=False,#torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
         fp16=True,
         optim="adamw_8bit",
@@ -142,6 +141,7 @@ def train(args):
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         formatting_func=formatting_func,
+        max_seq_length=args.max_seq_length,
         callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
     )
 
