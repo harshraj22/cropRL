@@ -82,7 +82,7 @@ def main(args):
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_msg}
                         ]
-                        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
                         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                         
                         with torch.no_grad():
@@ -91,6 +91,9 @@ def main(args):
                                 max_new_tokens=20,
                                 temperature=0.7,
                                 do_sample=True,
+                                top_p=0.8,
+                                top_k=20,
+                                min_p=0,
                                 pad_token_id=tokenizer.pad_token_id
                             )
                         

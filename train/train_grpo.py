@@ -201,7 +201,8 @@ def train(args):
                         prompt = tokenizer.apply_chat_template(
                             messages,
                             add_generation_prompt=True,
-                            tokenize=False
+                            tokenize=False,
+                            enable_thinking=False
                         )
 
                         prompts.append(prompt)
@@ -220,6 +221,9 @@ def train(args):
                         max_new_tokens=args.max_new_tokens,
                         do_sample=True,
                         temperature=args.temperature,
+                        top_p=0.8,
+                        top_k=20,
+                        min_p=0,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         prefix_allowed_tokens_fn=prefix_fn,
@@ -388,7 +392,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_GRPO_Run_1", help="WandB run name")
     parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_iterations", type=int, default=50, help="Total training iterations")
@@ -402,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument("--clip_eps", type=float, default=0.2, help="PPO clipping parameter")
     parser.add_argument("--beta", type=float, default=0.01, help="KL penalty coefficient")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens per action generation")
     parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N iterations")
     parser.add_argument("--output_dir", type=str, default="./train/checkpoints", help="Output directory for checkpoints")

@@ -133,7 +133,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # General & Architecture (matching GRPO)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Instruct", help="Hugging Face model path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Hugging Face model path")
     parser.add_argument("--run_name", type=str, default="CropRL_SFT_Run_1", help="WandB run name")
     
     # Training Hyperparameters
