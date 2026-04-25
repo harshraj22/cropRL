@@ -113,9 +113,10 @@ def train(args):
         max_seq_length=args.max_seq_length,
         bf16=torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
         optim="adamw_8bit",                     
-        callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
+        # callbacks=[SaveToStorageCallback(output_dir=args.output_dir)],
         torch_compile=True,              
-        torch_compile_backend="inductor"
+        torch_compile_backend="inductor",
+        dataloader_drop_last=True
     )
 
     def formatting_func(example):
