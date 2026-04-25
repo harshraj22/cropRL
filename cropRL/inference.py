@@ -369,6 +369,9 @@ def run_multi_agent_episode_llm(client: OpenAI, task_id: str):
         result = env.compute_result(trajectories)
         score = result.aggregate_score
         success = score >= 0.1
+        for agent_id in range(n):
+            terminal_profit = env._farms[agent_id].compute_terminal_value()
+            print(f"[AGENT {agent_id}] Terminal Profit: {terminal_profit:.4f}", flush=True)
         log_end(success=success, steps=total_steps, score=score, rewards=list(result.agent_scores.values()))
 
     except Exception as e:
