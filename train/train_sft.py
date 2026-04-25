@@ -121,8 +121,6 @@ def train(args):
         torch_compile=True,
         torch_compile_backend="inductor",
         dataloader_drop_last=True,
-        save_strategy="epoch",
-        eval_strategy="epoch",
         load_best_model_at_end=True,
         max_seq_length=args.max_seq_length,
         metric_for_best_model="eval_loss",
