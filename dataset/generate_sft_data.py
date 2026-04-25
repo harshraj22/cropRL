@@ -51,7 +51,7 @@ def main(args):
             env.reset(seed=args.seed_base + ep)
             
             n = env._ma_cfg.num_agents
-            max_steps = env._env_cfg.max_steps * n
+            max_steps = 1 # env._env_cfg.max_steps * n
             
             prev_net_worths = {i: env._farms[i].compute_net_worth() for i in range(n)}
             
@@ -164,9 +164,9 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B-Instruct", help="HuggingFace Teacher Model")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.6-35B-A3B", help="HuggingFace Teacher Model")
     parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
-    parser.add_argument("--num_episodes", type=int, default=10, help="Number of full episodes to run")
+    parser.add_argument("--num_episodes", type=int, default=1, help="Number of full episodes to run")
     parser.add_argument("--output_file", type=str, default="dataset/sft_data.jsonl", help="Output JSONL path")
     parser.add_argument("--seed_base", type=int, default=1000, help="Base seed for environment")
     args = parser.parse_args()

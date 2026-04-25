@@ -8,7 +8,7 @@ This directory contains the complete pipeline for training a small LLM (e.g., 0.
 **Script**: `dataset/generate_sft_data.py`
 We use a high-capacity Teacher LLM (like a 7B, 14B, or 72B model) to play the game and generate high-quality reasoning and strategies.
 ```bash
-python ../dataset/generate_sft_data.py --model_name Qwen/Qwen3-8B-Instruct --num_episodes 100 --output_file dataset/sft_data_1.jsonl
+python ../dataset/generate_sft_data.py --model_name Qwen/Qwen3-8B --num_episodes 100 --output_file dataset/sft_data_1.jsonl
 ```
 *Note: This script overwrites the output file to prevent duplicates. To generate large datasets, run it multiple times with different `--seed_base` and `--output_file` arguments.*
 
