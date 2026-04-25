@@ -39,7 +39,6 @@ def create_dummy_dataset():
     
     return Dataset.from_list([sample])
 
-
 def train(args):
     print("="*50)
     print("SFT TRAINING CONFIGURATION")
@@ -108,12 +107,20 @@ def train(args):
         report_to="wandb",
         max_seq_length=args.max_seq_length,
     )
+
+    def formatting_func(example):
+        return tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False  # False for SFT — we want to train on the full convo incl. assistant turn
+        )
     
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
+        formatting_func=formatting_func,
     )
     
     # --- 5. Execute Training ---
