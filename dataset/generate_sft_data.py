@@ -4,6 +4,7 @@ import json
 import argparse
 import torch
 from pathlib import Path
+from pprint import pprint
 
 # Ensure the root directory is on the path so cropRL module works
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -51,7 +52,7 @@ def main(args):
             env.reset(seed=args.seed_base + ep)
             
             n = env._ma_cfg.num_agents
-            max_steps = 1 # env._env_cfg.max_steps * n
+            max_steps = env._env_cfg.max_steps * n
             
             prev_net_worths = {i: env._farms[i].compute_net_worth() for i in range(n)}
             
@@ -133,6 +134,7 @@ def main(args):
                     
                     current_net_worth = env._farms[agent_id].compute_net_worth()
                     reward = current_net_worth - prev_net_worths[agent_id]
+                    print(f"Agent {agent_id} | Action: {action_name} | Reward: {reward:+.2f} | Net Worth: {current_net_worth:.2f} | prev Net Worth: {prev_net_worths[agent_id]:.2f}")
                     prev_net_worths[agent_id] = current_net_worth
                     
                     total_steps += 1
@@ -140,18 +142,22 @@ def main(args):
                     histories[agent_id].append(f"Step {getattr(new_obs, 'current_step', total_steps)}: Selected '{action_name}' -> Reward {reward:+.2f}")
                     agent_rewards[agent_id] += reward
                     
+                    # Set the total_return for this step's data point to the cumulative sum of rewards up to now
+                    if not obs.done:
+                        episode_buffer[agent_id][-1]["metadata"]["total_return"] = agent_rewards[agent_id]
+                    
                     if new_obs.done:
                         done_agents.add(agent_id)
             
-            # End of episode: write buffered data with total_return
+            # End of episode: write buffered data
             ep_returns = []
             for agent_id, data_points in episode_buffer.items():
-                total_return = agent_rewards[agent_id]
-                ep_returns.append(total_return)
+                ep_returns.append(agent_rewards[agent_id])
                 for dp in data_points:
-                    dp["metadata"]["total_return"] = total_return
                     f.write(json.dumps(dp) + "\n")
                     total_samples += 1
+                    if total_samples % 50 == 0:
+                        pprint(f"data points written: {dp} ")
             f.flush()
             tqdm.write(f"Episode {ep} finished | Steps: {total_steps} | Returns: {[round(r, 2) for r in ep_returns]}")
             
@@ -167,7 +173,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.6-27B", help="HuggingFace Teacher Model")
     parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of full episodes to run")
-    parser.add_argument("--output_file", type=str, default="dataset/sft_data.jsonl", help="Output JSONL path")
+    parser.add_argument("--output_file", type=str, default="dataset/sft_data1.jsonl", help="Output JSONL path")
     parser.add_argument("--seed_base", type=int, default=1000, help="Base seed for environment")
     args = parser.parse_args()
     main(args)

@@ -408,7 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens per action generation")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N iterations")
+    parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N iterations")
     parser.add_argument("--output_dir", type=str, default="./train/checkpoints", help="Output directory for checkpoints")
     
     args = parser.parse_args()
