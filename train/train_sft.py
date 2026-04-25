@@ -8,6 +8,7 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
+from callback import SaveToStorageCallback
 
 import wandb
 
@@ -96,9 +97,9 @@ def train(args):
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=args.batch_size,          # 👈 was 8, drop to 1
-        gradient_accumulation_steps=16,         # 👈 bump up to compensate (effective batch = 16)
-        gradient_checkpointing=True,            # 👈 add this — trades compute for memory
+        per_device_train_batch_size=args.batch_size,         
+        gradient_accumulation_steps=16,         
+        gradient_checkpointing=True,            
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
@@ -107,8 +108,9 @@ def train(args):
         save_steps=args.save_every,
         report_to="wandb",
         max_seq_length=args.max_seq_length,
-        bf16=torch.cuda.is_bf16_supported(),    # 👈 make this explicit
-        optim="adamw_8bit",                     # 👈 8-bit Adam saves ~2GB optimizer state
+        bf16=torch.cuda.is_bf16_supported(),    # ToDo: should we add fp16 parameter?
+        optim="adamw_8bit",                     
+        callbacks=[SaveToStorageCallback(output_dir=args.output_dir)]
     )
 
     def formatting_func(example):
