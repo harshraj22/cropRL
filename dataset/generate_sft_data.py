@@ -3,13 +3,14 @@ import sys
 import json
 import argparse
 import torch
+import subprocess
 from pathlib import Path
 from pprint import pprint
 
 # Ensure the root directory is on the path so cropRL module works
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from cropRL.tasks import create_env_for_task
 from cropRL.models import MultiAgentAction
 from cropRL.inference import get_agent_system_prompt, parse_action
@@ -36,10 +37,22 @@ def main(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
+    quantization_config = None
+    if args.quantize == "4bit":
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+    elif args.quantize == "8bit":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        device_map="auto"
+        device_map="auto",
+        quantization_config=quantization_config
     )
     model.eval()
     
@@ -134,7 +147,7 @@ def main(args):
                     
                     current_net_worth = env._farms[agent_id].compute_net_worth()
                     reward = current_net_worth - prev_net_worths[agent_id]
-                    print(f"Agent {agent_id} | Action: {action_name} | Reward: {reward:+.2f} | Net Worth: {current_net_worth:.2f} | prev Net Worth: {prev_net_worths[agent_id]:.2f}")
+                    # print(f"Agent {agent_id} | Action: {action_name} | Reward: {reward:+.2f} | Net Worth: {current_net_worth:.2f} | prev Net Worth: {prev_net_worths[agent_id]:.2f}")
                     prev_net_worths[agent_id] = current_net_worth
                     
                     total_steps += 1
@@ -156,10 +169,24 @@ def main(args):
                 for dp in data_points:
                     f.write(json.dumps(dp) + "\n")
                     total_samples += 1
-                    if total_samples % 50 == 0:
+                    if total_samples % 100 == 0:
                         pprint(f"data points written: {dp} ")
             f.flush()
+            os.fsync(f.fileno())
             tqdm.write(f"Episode {ep} finished | Steps: {total_steps} | Returns: {[round(r, 2) for r in ep_returns]}")
+            
+            # Sync to huggingface bucket
+            try:
+                tqdm.write("Syncing dataset to HuggingFace bucket...")
+                subprocess.run(
+                    ["hf", "buckets", "sync", str(output_path.parent), "hf://buckets/harshraj22/croprl-workspace/generate_dataset"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                tqdm.write("Sync complete.")
+            except subprocess.CalledProcessError as e:
+                tqdm.write(f"Warning: Failed to sync to bucket. Error: {e.stderr}")
             
     print("="*50)
     print("DATA GENERATION COMPLETE")
@@ -172,8 +199,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.6-27B", help="HuggingFace Teacher Model")
     parser.add_argument("--task", type=str, default="easy_2agent", help="CropRL task identifier")
-    parser.add_argument("--num_episodes", type=int, default=60, help="Number of full episodes to run")
+    parser.add_argument("--num_episodes", type=int, default=20, help="Number of full episodes to run")
     parser.add_argument("--output_file", type=str, default="dataset/sft_data1.jsonl", help="Output JSONL path")
     parser.add_argument("--seed_base", type=int, default=1000, help="Base seed for environment")
+    parser.add_argument("--quantize", type=str, choices=["none", "4bit", "8bit"], default="none", help="Quantize model to fit on smaller GPUs")
     args = parser.parse_args()
     main(args)

@@ -62,6 +62,7 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right" # Crucial for SFT causal LM training
         
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -104,15 +105,15 @@ def train(args):
         max_grad_norm=args.max_grad_norm,
         logging_steps=1,
         save_steps=args.save_every,
+        report_to="wandb",
         max_seq_length=args.max_seq_length,
-        report_to="wandb"
     )
     
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
     
     # --- 5. Execute Training ---
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="CropRL_SFT_Run_1", help="WandB run name")
     
     # Training Hyperparameters
-    parser.add_argument("--num_epochs", type=int, default=3, help="Total training epochs")
+    parser.add_argument("--num_epochs", type=int, default=30, help="Total training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Grad accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for LoRA")
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     
     # Output
-    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N steps")
+    parser.add_argument("--save_every", type=int, default=3, help="Save checkpoint every N steps")
     parser.add_argument("--output_dir", type=str, default="./train/sft_checkpoints", help="Output directory")
     parser.add_argument("--data_path", type=str, default=None, help="Path to SFT JSONL dataset. Uses dummy if not provided.")
     
