@@ -96,8 +96,9 @@ def train(args):
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        per_device_train_batch_size=1,          # 👈 was 8, drop to 1
+        gradient_accumulation_steps=16,         # 👈 bump up to compensate (effective batch = 16)
+        gradient_checkpointing=True,            # 👈 add this — trades compute for memory
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
@@ -106,6 +107,8 @@ def train(args):
         save_steps=args.save_every,
         report_to="wandb",
         max_seq_length=args.max_seq_length,
+        bf16=torch.cuda.is_bf16_supported(),    # 👈 make this explicit
+        optim="adamw_8bit",                     # 👈 8-bit Adam saves ~2GB optimizer state
     )
 
     def formatting_func(example):
