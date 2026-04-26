@@ -1,64 +1,91 @@
 """
-CropRL Core Environment.
+MultiAgentCroprlEnvironment — the OpenEnv-compatible multi-agent environment.
 
-Implements the OpenEnv Environment interface for the farm management
-simulation. Orchestrates the step loop by delegating physics to the
-dynamics engine.
+Implements ``Environment[MultiAgentAction, MultiAgentObservation, MultiAgentState]``.
+Manages N ``FarmState`` instances (plain state containers, NOT OpenEnv environments).
 
-Key design change (v2): Only the ``Wait`` action advances the calendar
-month.  All other actions execute instantly within the current month.
-The step counter increments on every action.
+Key responsibilities:
+- Route agent actions to the correct FarmState.
+- Gate month advancement behind the slot-based TimeController.
+- Intercept sell actions to queue them through the MarketEngine (batch clearing).
+- Maintain the PublicLedger and Forum for inter-agent information.
+- Emit MultiAgentObservation combining private farm state with shared world state.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-import numpy as np
-
-from openenv.core.env_server.types import Observation, State
 from openenv.core.env_server.interfaces import Environment
 
-from cropRL.config import EnvConfig
+from cropRL.config import EnvConfig, MultiAgentConfig
 from cropRL.dynamics import (
-    apply_spoilage,
     calculate_expected_yield_potential,
-    calculate_interest_rate,
-    calculate_yield,
     format_text_observation,
-    generate_market_prices,
-    generate_rainfall,
-    realise_rainfall,
 )
-from cropRL.enums import ActionType, CropType
-from cropRL.models import CroprlAction, CroprlObservation, CroprlState
+from cropRL.enums import ActionType, CropType, LedgerEventType
+from cropRL.farm_state import FarmState
+from cropRL.market_engine import MarketEngine
+from cropRL.models import (
+    LedgerEvent,
+    MultiAgentAction,
+    MultiAgentObservation,
+    MultiAgentResult,
+    MultiAgentState,
+)
+from cropRL.public_ledger import Forum, PublicLedger
+from cropRL.time_controller import TimeController
 
 
-class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState]):
+class MultiAgentCroprlEnvironment(
+    Environment[MultiAgentAction, MultiAgentObservation, MultiAgentState]
+):
     """
-    Farm management RL environment.
+    Multi-agent farm management environment implementing the OpenEnv interface.
 
-    The agent manages a small Indian farm.  Each step the agent picks one
-    of 11 discrete actions.  Only the ``Wait`` action advances the calendar
-    month and triggers monthly dynamics (rainfall realisation, crop ageing,
-    nitrogen drain, interest accrual, spoilage, fixed costs, and new
-    weather/price generation).  All other actions execute instantly within
-    the current month.
+    N agents each own a private ``FarmState`` (their farm).
+    A shared ``TimeController`` synchronises the calendar month using a
+    slot-based budget: the month advances only when every agent has
+    used all slots.
+
+    Sell actions (HARVEST_SELL, SELL_INVENTORY) are **deferred**: they are
+    queued in the ``MarketEngine`` and cleared at month-end, so collective
+    sell volume affects the clearing price for all sellers that month.
     """
+
+    SUPPORTS_CONCURRENT_SESSIONS = True
 
     def __init__(
         self,
-        config: Optional[EnvConfig] = None,
-        task_id: str = "default",
+        env_config: Optional[EnvConfig] = None,
+        ma_config: Optional[MultiAgentConfig] = None,
+        task_id: str = "multi_default",
     ) -> None:
         super().__init__()
-        self.config = config or EnvConfig()
-        self.task_id = task_id
+        self._env_cfg = env_config or EnvConfig()
+        self._ma_cfg = ma_config or MultiAgentConfig()
+        self._task_id = task_id
 
-        self._rng: Optional[np.random.Generator] = None
-        self._internal: dict[str, Any] = {}
-        self._state = CroprlState(task_id=task_id)
+        n = self._ma_cfg.num_agents
+
+        # Shared infrastructure
+        self._time_ctrl = TimeController(n, self._ma_cfg.action_slots_per_month)
+        self._ledger = PublicLedger()
+        self._forum = Forum(n, self._ma_cfg.forum_messages_per_month, self._ledger)
+
+        # Per-farm state (initialised in reset)
+        self._farms: List[FarmState] = []
+        self._market: Optional[MarketEngine] = None
+        self._shared_rng: Optional[np.random.Generator] = None
+        self._hype_statuses: list = []
+        self._last_realised: Tuple[float, ...] = tuple(self._env_cfg.base_market_prices[1:])
+
+        self.episode_id: str = ""
+        self._state = MultiAgentState(
+            num_agents=n, task_id=task_id,
+        )
 
     # ──────────────────────────────────────────────────────────────
     # OpenEnv interface: reset
@@ -69,95 +96,47 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
         **kwargs: Any,
-    ) -> CroprlObservation:
-        """Start a new episode."""
-        self._rng = np.random.default_rng(seed)
-        cfg = self.config
+    ) -> MultiAgentObservation:
+        """
+        Reset the environment and return initial observation (agent 0).
 
-        month = 1  # January
-        step = 0
+        Callers should use ``get_obs(agent_id)`` to get each agent's
+        initial observation before the episode loop.
+        """
+        self.episode_id = episode_id or str(uuid4())
+        base_seed = seed if seed is not None else 42
+        n = self._ma_cfg.num_agents
 
-        # Generate stochastic values for month 1
-        rainfall = generate_rainfall(month, cfg, self._rng)
-        prices = generate_market_prices(month, cfg, self._rng)
+        self._shared_rng = np.random.default_rng(base_seed)
 
-        # Interest rate (no crop planted → optimal_water = 0.0)
-        interest_rate = calculate_interest_rate(
-            cfg.base_interest_rate, month, rainfall, 0.0
+        # Create N independent FarmStates with unique seeds
+        self._farms = []
+        for i in range(n):
+            rng_i = np.random.default_rng(base_seed + i + 1)
+            farm = FarmState(config=self._env_cfg, rng=rng_i)
+            self._farms.append(farm)
+
+        # Reset shared state
+        self._time_ctrl.reset()
+        self._ledger.reset_month()
+        self._forum.reset_month()
+
+        # Fresh MarketEngine
+        self._market = MarketEngine(
+            self._ma_cfg, self._env_cfg, self._shared_rng
+        )
+        self._hype_statuses = self._market.hype_statuses()
+
+        # Update state
+        self._state = MultiAgentState(
+            num_agents=n,
+            current_month=self._farms[0].month,
+            month_count=0,
+            episode_id=self.episode_id,
+            task_id=self._task_id,
         )
 
-        # Internal farm state
-        self._internal = {
-            "month": month,
-            "step": step,
-            "month_count": 0,
-            "year": 1,
-            "expected_rainfall": rainfall,
-            "prices": prices,
-            "interest_rate": interest_rate,
-            # Crop
-            "active_crop_type": CropType.FALLOW,
-            "crop_age_months": 0,
-            "planting_month": 0,  # month when current crop was planted
-            # Soil
-            "soil_nitrogen": cfg.initial_soil_nitrogen,
-            # Water
-            "water_level": 0.0,
-            # Finance
-            "cash": cfg.initial_cash,
-            "debt": 0.0,
-            "has_active_loan": False,
-            "loan_interest_rate": 0.0,
-            # Storage
-            "stored_crop_type": CropType.FALLOW,
-            "stored_amount": 0.0,
-            "stored_age_months": 0,
-            # Per-step flags
-            "irrigated": False,
-            "fertilized": False,
-            # Inflated values (mutated by inflation each year)
-            "inflated_seed_costs": list(cfg.seed_costs),
-            "inflated_cost_irrigate": cfg.cost_irrigate,
-            "inflated_cost_fertilize": cfg.cost_fertilize,
-            "inflated_loan_chunk": cfg.loan_chunk,
-            "inflated_base_land_price": cfg.base_land_price,
-            "inflated_monthly_fixed_cost": cfg.monthly_fixed_cost,
-            "inflated_base_market_prices": list(cfg.base_market_prices),
-        }
-
-        # Compute initial net worth for reward tracking
-        self._internal["prev_net_worth"] = self._compute_net_worth()
-
-        # Compute derived fields
-        yield_potential = calculate_expected_yield_potential(
-            crop_type=CropType.FALLOW,
-            crop_age=0,
-            soil_nitrogen=cfg.initial_soil_nitrogen,
-            current_water_level=0.0,
-            current_month=month,
-            config=cfg,
-        )
-
-        # Build state object
-        self._state = CroprlState(
-            episode_id=episode_id or str(uuid4()),
-            step_count=0,
-            irrigated_this_month=False,
-            fertilized_this_month=False,
-            previous_cash=cfg.initial_cash,
-            has_active_loan=False,
-            loan_interest_rate=0.0,
-            current_month_count=0,
-            current_year=1,
-            task_id=self.task_id,
-        )
-
-        return self._build_observation(
-            yield_potential=yield_potential,
-            reward=0.0,
-            done=False,
-            message="New episode started. Your farm awaits!",
-        )
+        return self._build_ma_obs(0, "Episode started.", 0.0, False)
 
     # ──────────────────────────────────────────────────────────────
     # OpenEnv interface: step
@@ -165,643 +144,510 @@ class CroprlEnvironment(Environment[CroprlAction, CroprlObservation, CroprlState
 
     def step(
         self,
-        action: CroprlAction,
+        action: MultiAgentAction,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
-    ) -> CroprlObservation:
+    ) -> MultiAgentObservation:
         """
-        Execute one step.
+        Execute one step for the agent identified by ``action.agent_id``.
 
-        1. Record previous net worth
-        2. Execute the chosen action (instant effects)
-        3. Increment step counter
-        4. If action == Wait: advance monthly dynamics
-        5. Check termination
-        6. Calculate reward as Δ(net_worth) + penalties
-        7. Return observation
+        The underlying month advances only when all agents have exhausted
+        their slot budgets.
         """
-        cfg = self.config
-        s = self._internal
+        agent_id = action.agent_id
+        n = self._ma_cfg.num_agents
+        if agent_id < 0 or agent_id >= n:
+            raise ValueError(f"Invalid agent_id {agent_id}; expected 0..{n-1}")
+
+        # Guard: out of slots
+        if self._time_ctrl.slots_remaining(agent_id) <= 0:
+            return self._build_ma_obs(
+                agent_id,
+                "You have exhausted your action slots for this month. Waiting for others.",
+                0.0,
+                False,
+            )
+
         action_id = action.action_id
-        messages: list[str] = []
+        farm = self._farms[agent_id]
+        s = farm.s
         penalty = 0.0
+        messages: List[str] = []
 
-        # ── 1. Execute action ──────────────────────────────────────
-        s["irrigated"] = False
-        s["fertilized"] = False
+        # ── Handle Wait / No-Op (action 0) ────────────────────────────
+        if action_id == ActionType.WAIT:
+            self._ledger.record(LedgerEvent(
+                agent_id=agent_id,
+                month=self._current_month(),
+                slot=self._time_ctrl.current_slot_for(agent_id),
+                event_type=LedgerEventType.WAIT,
+            ))
+            messages.append("You waited / took no action this slot.")
+
+        # ── Execute action ────────────────────────────────────────
+        slot = self._time_ctrl.current_slot_for(agent_id)
 
         if action_id == ActionType.WAIT:
-            messages.append("You waited this month.")
-            # Month advance happens in step 4 below
-
-        elif action_id in (ActionType.PLANT_CORN, ActionType.PLANT_WHEAT, ActionType.PLANT_CHICKPEA):
-            penalty, msg = self._do_plant(s, action_id)
+            pass  # Already handled above
+        
+        elif action_id == ActionType.POST_MESSAGE:
+            penalty, msg = self._do_post_message(agent_id, slot, action)
             messages.append(msg)
+
+        elif action_id in (
+            ActionType.PLANT_CORN, ActionType.PLANT_WHEAT, ActionType.PLANT_CHICKPEA,
+        ):
+            penalty, msg = farm.do_plant(action_id)
+            messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.PLANTED,
+                    payload={"crop_type": action_id},
+                ))
+
+        elif action_id in (ActionType.PLANT_MATCHA, ActionType.PLANT_QUINOA,
+                           ActionType.PLANT_TURMERIC):
+            crop_map = {
+                ActionType.PLANT_MATCHA: CropType.MATCHA,
+                ActionType.PLANT_QUINOA: CropType.QUINOA,
+                ActionType.PLANT_TURMERIC: CropType.TURMERIC,
+            }
+            penalty, msg = farm.do_plant_hype(crop_map[action_id])
+            messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.PLANTED,
+                    payload={"crop_type": int(crop_map[action_id])},
+                ))
 
         elif action_id == ActionType.IRRIGATE:
-            penalty, msg = self._do_irrigate(s)
+            penalty, msg = farm.do_irrigate()
             messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.IRRIGATED,
+                ))
 
         elif action_id == ActionType.FERTILIZE:
-            penalty, msg = self._do_fertilize(s)
+            penalty, msg = farm.do_fertilize()
             messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.FERTILIZED,
+                ))
 
         elif action_id == ActionType.HARVEST_STORE:
-            penalty, msg = self._do_harvest_store(s, cfg)
+            penalty, msg, old_crop_type, old_volume = farm.do_harvest_store()
             messages.append(msg)
+            if penalty == 0.0:
+                if old_volume > 0 and self._market is not None:
+                    self._market.queue_sell(agent_id, old_crop_type, old_volume, is_inventory=True)
+                
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.HARVESTED_STORED,
+                    payload={
+                        "crop_type": s["stored_crop_type"],
+                        "amount": s["stored_amount"],
+                    },
+                ))
 
         elif action_id == ActionType.HARVEST_SELL:
-            penalty, msg = self._do_harvest_sell(s, cfg)
+            penalty, msg, crop_t, volume = farm.do_harvest_sell_queued()
             messages.append(msg)
+            if penalty == 0.0 and self._market:
+                self._market.queue_sell(agent_id, crop_t, volume, is_inventory=False)
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.HARVESTED_SOLD,
+                    payload={"crop_type": crop_t, "amount": round(volume, 2)},
+                ))
 
         elif action_id == ActionType.SELL_INVENTORY:
-            penalty, msg = self._do_sell_inventory(s)
+            penalty, msg, crop_t, volume = farm.do_sell_inventory_queued()
             messages.append(msg)
+            if penalty == 0.0 and self._market:
+                self._market.queue_sell(agent_id, crop_t, volume, is_inventory=True)
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.SOLD_INVENTORY,
+                    payload={"crop_type": crop_t, "amount": round(volume, 2)},
+                ))
 
         elif action_id == ActionType.TAKE_LOAN:
-            penalty, msg = self._do_take_loan(s)
+            penalty, msg = farm.do_take_loan()
             messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.LOAN_TAKEN,
+                ))
 
         elif action_id == ActionType.REPAY_LOAN:
-            penalty, msg = self._do_repay_loan(s)
+            penalty, msg = farm.do_repay_loan()
             messages.append(msg)
+            if penalty == 0.0:
+                self._ledger.record(LedgerEvent(
+                    agent_id=agent_id, month=self._current_month(), slot=slot,
+                    event_type=LedgerEventType.LOAN_REPAID,
+                ))
 
-        # ── 2. Increment step counter ──────────────────────────────
+        else:
+            messages.append(f"INVALID: Unknown action id {action_id}.")
+            penalty = self._env_cfg.invalid_action_penalty
+
+        # ── Consume slot ──────────────────────────────────────────
+        self._time_ctrl.consume_slot(agent_id)
         s["step"] += 1
 
-        # ── 3. If Wait: advance monthly dynamics ──────────────────
-        if action_id == ActionType.WAIT:
-            month_messages = self._advance_month(s, cfg)
-            messages.extend(month_messages)
+        # ── Auto-advance month if all agents exhausted budgets ────────────
+        if self._time_ctrl.all_done():
+            adv_msgs = self._do_advance_month()
+            messages.extend(adv_msgs)
 
-        # ── 4. Check termination ───────────────────────────────────
-        done = False
-        terminal_bonus = 0.0
-
-        if s["step"] >= cfg.max_steps or s["month_count"] >= cfg.max_months:
-            done = True
-            terminal_bonus = self._compute_terminal_value(s, cfg)
-            messages.append(
-                f"EPISODE COMPLETE! Terminal profit: ₹{terminal_bonus:,.0f}."
-            )
-        elif s["cash"] < 0 and s["has_active_loan"]:
-            done = True
-            penalty += cfg.bankruptcy_penalty
-            messages.append(
-                "BANKRUPTCY! Cash is negative and you have outstanding debt."
-            )
-
-        # ── 5. Calculate reward ────────────────────────────────────
-        current_net_worth = self._compute_net_worth()
-        if done and terminal_bonus != 0:
-            # On terminal step, reward includes the profit calculation
-            reward = terminal_bonus + penalty
-        else:
-            reward = (current_net_worth - s["prev_net_worth"]) + penalty
-        s["prev_net_worth"] = current_net_worth
-
-        # ── 6. Compute derived observation fields ──────────────────
-        yield_potential = calculate_expected_yield_potential(
-            s["active_crop_type"],
-            s["crop_age_months"],
-            s["soil_nitrogen"],
-            s["water_level"],
-            s["planting_month"] or s["month"],
-            cfg,
-        )
-
-        # Update state object
-        self._state.step_count = s["step"]
-        self._state.irrigated_this_month = s["irrigated"]
-        self._state.fertilized_this_month = s["fertilized"]
-        self._state.previous_cash = s["cash"]
-        self._state.has_active_loan = s["has_active_loan"]
-        self._state.loan_interest_rate = s["loan_interest_rate"]
-        self._state.current_month_count = s["month_count"]
-        self._state.current_year = s["year"]
-
-        return self._build_observation(
-            yield_potential=yield_potential,
-            reward=reward,
-            done=done,
-            message=" | ".join(messages),
-        )
+        done = self._check_termination(farm)
+        return self._build_ma_obs(agent_id, " | ".join(messages), penalty, done)
 
     # ──────────────────────────────────────────────────────────────
     # OpenEnv interface: state
     # ──────────────────────────────────────────────────────────────
 
     @property
-    def state(self) -> CroprlState:
-        """Return the current internal state."""
+    def state(self) -> MultiAgentState:
+        """Return current environment state."""
+        self._state.current_month = self._current_month()
+        if self._farms:
+            self._state.month_count = self._farms[0].month_count
         return self._state
 
     # ──────────────────────────────────────────────────────────────
-    # Action handlers
+    # Public: get_obs
     # ──────────────────────────────────────────────────────────────
 
-    def _do_plant(self, s: dict, action_id: int) -> tuple[float, str]:
-        """Execute a plant action. Returns (penalty, message)."""
-        cfg = self.config
-        crop_idx = action_id  # action 1→crop 1, 2→2, 3→3
-        seed_cost = s["inflated_seed_costs"][crop_idx]
+    def get_obs(self, agent_id: int) -> MultiAgentObservation:
+        """Get the current observation for a specific agent."""
+        done = self._check_termination(self._farms[agent_id])
+        return self._build_ma_obs(agent_id, "", 0.0, done)
 
-        if s["active_crop_type"] != CropType.FALLOW:
-            return cfg.invalid_action_penalty, (
-                f"INVALID: Cannot plant — land already has "
-                f"{cfg.crop_names[s['active_crop_type']]} growing."
-            )
-        if s["cash"] < seed_cost:
-            return cfg.invalid_action_penalty, (
-                f"INVALID: Not enough cash to plant "
-                f"{cfg.crop_names[crop_idx]} "
-                f"(need ₹{seed_cost:,.0f}, have ₹{s['cash']:,.0f})."
-            )
+    # ──────────────────────────────────────────────────────────────
+    # Grading
+    # ──────────────────────────────────────────────────────────────
 
-        s["cash"] -= seed_cost
-        s["active_crop_type"] = crop_idx
-        s["crop_age_months"] = 0
-        s["planting_month"] = s["month"]  # lock season at planting time
-        return 0.0, (
-            f"Planted {cfg.crop_names[crop_idx]}. Cost: ₹{seed_cost:,.0f}."
+    def compute_result(self, trajectories: Optional[Dict[int, list]] = None) -> MultiAgentResult:
+        """Compute final per-agent scores and aggregate metrics."""
+        from cropRL.tasks import grader, TASKS
+
+        base_task = self._task_id
+        for _n in (2, 4, 8):
+            base_task = base_task.replace(f"_{_n}agent", "")
+        if base_task not in TASKS:
+            base_task = "medium"
+
+        agent_scores: Dict[int, float] = {}
+        net_worths: Dict[int, float] = {}
+
+        for i, farm in enumerate(self._farms):
+            nw = farm.compute_net_worth(clearing_prices=self._last_realised)
+            net_worths[i] = nw
+            traj = (trajectories or {}).get(i, [])
+            bankrupt = farm.cash < 0 and farm.has_active_loan
+            score = grader(base_task, nw, bankrupt, traj)
+            agent_scores[i] = float(score)
+
+        mode = self._ma_cfg.objective_mode
+        if mode == "cooperative":
+            agg = float(np.mean(list(agent_scores.values())))
+        elif mode == "mixed":
+            w = self._ma_cfg.mixed_mode_village_weight
+            village_avg = float(np.mean(list(agent_scores.values())))
+            agg_scores = {
+                i: (1 - w) * agent_scores[i] + w * village_avg
+                for i in agent_scores
+            }
+            agg = float(np.mean(list(agg_scores.values())))
+            agent_scores = agg_scores
+        else:  # competitive
+            agg = float(max(agent_scores.values()))
+
+        winner = (
+            max(agent_scores, key=agent_scores.get)  # type: ignore
+            if mode != "cooperative"
+            else None
         )
 
-    def _do_irrigate(self, s: dict) -> tuple[float, str]:
-        """Execute irrigate action. Returns (penalty, message)."""
-        cfg = self.config
-        irrigate_cost = s["inflated_cost_irrigate"]
+        gini = self._gini(list(net_worths.values()))
+        total_nw = float(sum(net_worths.values()))
 
-        if s["active_crop_type"] == CropType.FALLOW:
-            return cfg.invalid_action_penalty, (
-                "INVALID: Nothing to irrigate — land is fallow."
-            )
-        if s["cash"] < irrigate_cost:
-            return cfg.invalid_action_penalty, (
-                f"INVALID: Not enough cash to irrigate "
-                f"(need ₹{irrigate_cost:,.0f})."
-            )
-
-        s["cash"] -= irrigate_cost
-        s["irrigated"] = True
-
-        # Instant water level increase
-        crop_t = s["active_crop_type"]
-        s["water_level"] += cfg.irrigate_amount[crop_t]
-        optimal = cfg.optimal_water_level[crop_t]
-        s["water_level"] = min(s["water_level"], optimal)
-
-        return 0.0, (
-            f"Irrigated. Water level now {s['water_level']:.2f}. "
-            f"Cost: ₹{irrigate_cost:,.0f}."
+        return MultiAgentResult(
+            agent_scores=agent_scores,
+            aggregate_score=float(np.clip(agg, 0.01, 0.99)),
+            winner_agent_id=winner,
+            gini_coefficient=gini,
+            total_village_nw=total_nw,
         )
 
-    def _do_fertilize(self, s: dict) -> tuple[float, str]:
-        """Execute fertilize action. Returns (penalty, message)."""
-        cfg = self.config
-        fert_cost = s["inflated_cost_fertilize"]
+    # ──────────────────────────────────────────────────────────────
+    # Forum action handler
+    # ──────────────────────────────────────────────────────────────
 
-        if s["cash"] < fert_cost:
-            return cfg.invalid_action_penalty, (
-                f"INVALID: Not enough cash to fertilize "
-                f"(need ₹{fert_cost:,.0f})."
-            )
-
-        s["cash"] -= fert_cost
-        s["soil_nitrogen"] = min(
-            1.0, s["soil_nitrogen"] + cfg.fertilize_nitrogen_boost
+    def _do_post_message(
+        self, agent_id: int, slot: int, action: MultiAgentAction,
+    ) -> Tuple[float, str]:
+        text = action.forum_message or "(no message)"
+        success, msg = self._forum.post(
+            agent_id=agent_id,
+            month=self._current_month(),
+            slot=slot,
+            text=text,
         )
-        s["fertilized"] = True
-        return 0.0, (
-            f"Fertilized. Soil nitrogen boosted to "
-            f"{s['soil_nitrogen']:.2f}. Cost: ₹{fert_cost:,.0f}."
-        )
-
-    def _do_harvest_store(
-        self, s: dict, cfg: EnvConfig
-    ) -> tuple[float, str]:
-        """Execute Harvest & Store action. Returns (penalty, message)."""
-        if s["active_crop_type"] == CropType.FALLOW or s["crop_age_months"] < 1:
-            return cfg.invalid_action_penalty, (
-                "INVALID: Nothing to harvest — "
-                "no crop planted or crop too young."
-            )
-
-        crop_type = s["active_crop_type"]
-        harvested = calculate_yield(
-            crop_type,
-            s["crop_age_months"],
-            s["soil_nitrogen"],
-            s["water_level"],
-            s["planting_month"],
-            cfg,
-            rng=self._rng,
-        )
-
-        parts: list[str] = []
-
-        # Auto-sell existing storage if occupied
-        if s["stored_amount"] > 0:
-            old_type = s["stored_crop_type"]
-            old_price = s["prices"][old_type - 1]
-            old_revenue = s["stored_amount"] * old_price
-            s["cash"] += old_revenue
-            parts.append(
-                f"Auto-sold {s['stored_amount']:.1f} tons of "
-                f"{cfg.crop_names[old_type]} for ₹{old_revenue:,.0f}."
-            )
-
-        # Store new harvest
-        s["stored_crop_type"] = crop_type
-        s["stored_amount"] = harvested
-        s["stored_age_months"] = 0
-
-        # Reset land
-        s["active_crop_type"] = CropType.FALLOW
-        s["crop_age_months"] = 0
-        s["planting_month"] = 0
-
-        parts.append(
-            f"Harvested {harvested:.1f} tons of {cfg.crop_names[crop_type]} "
-            f"and stored it."
-        )
-        return 0.0, " ".join(parts)
-
-    def _do_harvest_sell(
-        self, s: dict, cfg: EnvConfig
-    ) -> tuple[float, str]:
-        """Execute Harvest & Sell action. Returns (penalty, message)."""
-        if s["active_crop_type"] == CropType.FALLOW or s["crop_age_months"] < 1:
-            return cfg.invalid_action_penalty, (
-                "INVALID: Nothing to harvest — "
-                "no crop planted or crop too young."
-            )
-
-        crop_type = s["active_crop_type"]
-        harvested = calculate_yield(
-            crop_type,
-            s["crop_age_months"],
-            s["soil_nitrogen"],
-            s["water_level"],
-            s["planting_month"],
-            cfg,
-            rng=self._rng,
-        )
-
-        price = s["prices"][crop_type - 1]
-        revenue = harvested * price
-        s["cash"] += revenue
-
-        # Reset land
-        s["active_crop_type"] = CropType.FALLOW
-        s["crop_age_months"] = 0
-        s["planting_month"] = 0
-
-        return 0.0, (
-            f"Harvested {harvested:.1f} tons of {cfg.crop_names[crop_type]} "
-            f"and sold at ₹{price:,.0f}/ton. Revenue: ₹{revenue:,.0f}."
-        )
-
-    def _do_sell_inventory(self, s: dict) -> tuple[float, str]:
-        """Execute Sell Inventory action. Returns (penalty, message)."""
-        cfg = self.config
-        if s["stored_amount"] <= 0:
-            return cfg.invalid_action_penalty, (
-                "INVALID: Storage is empty — nothing to sell."
-            )
-
-        crop_t = s["stored_crop_type"]
-        price = s["prices"][crop_t - 1]
-        revenue = s["stored_amount"] * price
-        s["cash"] += revenue
-        msg = (
-            f"Sold {s['stored_amount']:.1f} tons of "
-            f"{cfg.crop_names[crop_t]} at ₹{price:,.0f}/ton. "
-            f"Revenue: ₹{revenue:,.0f}."
-        )
-        s["stored_crop_type"] = CropType.FALLOW
-        s["stored_amount"] = 0.0
-        s["stored_age_months"] = 0
+        if not success:
+            return self._env_cfg.invalid_action_penalty, msg
         return 0.0, msg
 
-    def _do_take_loan(self, s: dict) -> tuple[float, str]:
-        """Execute Take Loan action. Returns (penalty, message)."""
-        cfg = self.config
-        if s["has_active_loan"]:
-            return cfg.invalid_action_penalty, (
-                "INVALID: You already have an active loan. "
-                "Repay it first before taking another."
-            )
-
-        loan_amount = s["inflated_loan_chunk"]
-        s["cash"] += loan_amount
-        s["debt"] += loan_amount
-        s["has_active_loan"] = True
-        # Lock the interest rate at loan origination
-        s["loan_interest_rate"] = s["interest_rate"]
-        return 0.0, (
-            f"Took a loan of ₹{loan_amount:,.0f} at "
-            f"{s['loan_interest_rate'] * 100:.1f}% annual. "
-            f"Total debt: ₹{s['debt']:,.0f}."
-        )
-
-    def _do_repay_loan(self, s: dict) -> tuple[float, str]:
-        """Execute Repay Loan action. Returns (penalty, message)."""
-        cfg = self.config
-        if not s["has_active_loan"]:
-            return cfg.invalid_action_penalty, (
-                "INVALID: No active loan to repay."
-            )
-        if s["cash"] < s["debt"]:
-            return cfg.invalid_action_penalty, (
-                f"INVALID: Not enough cash to repay full debt. "
-                f"Need ₹{s['debt']:,.0f}, have ₹{s['cash']:,.0f}."
-            )
-
-        repay_amount = s["debt"]
-        s["cash"] -= repay_amount
-        s["debt"] = 0.0
-        s["has_active_loan"] = False
-        s["loan_interest_rate"] = 0.0
-        return 0.0, (
-            f"Repaid full loan of ₹{repay_amount:,.0f}. "
-            f"You are now debt-free."
-        )
-
     # ──────────────────────────────────────────────────────────────
-    # Monthly dynamics (called only from Wait action)
+    # Month advancement
     # ──────────────────────────────────────────────────────────────
 
-    def _advance_month(self, s: dict, cfg: EnvConfig) -> list[str]:
+    def _do_advance_month(self) -> List[str]:
         """
-        Advance all monthly dynamics.  Called once per ``Wait`` action.
-
-        Order of operations:
-        1. Increment month & month_count
-        2. Check & apply inflation (on year boundary)
-        3. Realise rainfall
-        4. Update water level (rain + consumption)
-        5. Age crop & apply monthly nitrogen impact
-        6. Natural nitrogen recovery
-        7. Age storage & check spoilage
-        8. Accrue interest on debt (locked rate)
-        9. Deduct monthly fixed cost
-        10. Generate new expected rainfall & market prices
-        11. Update interest rate
+        Called when all agents have ended their turn.
+        1. Resolve market (collect revenues, tick hype).
+        2. Credit revenues to each farm.
+        3. Advance all farms' monthly physics.
+        4. Update shared prices from market engine.
+        5. Reset ledger / forum for the new month.
+        6. Advance TimeController.
         """
-        messages: list[str] = []
+        assert self._market is not None
+        messages: List[str] = []
 
-        # 1. Increment month
-        old_month = s["month"]
-        s["month"] = (s["month"] % 12) + 1
-        s["month_count"] += 1
+        # 1. Resolve market clearing
+        revenues = self._market.resolve_month(self._current_month())
+        self._last_realised = self._market.last_month_realised_prices
+        self._hype_statuses = self._market.hype_statuses()
 
-        # 2. Inflation check (when month wraps to January)
-        if s["month"] == 1 and old_month == 12:
-            self._apply_inflation(s, cfg)
-            s["year"] += 1
-            messages.append(
-                f"Year {s['year']} begins. "
-                f"Inflation applied ({cfg.inflation_rate * 100:.0f}%)."
-            )
-
-        # 3. Realise rainfall
-        realised = realise_rainfall(
-            s["expected_rainfall"],
-            cfg.weather_sigma_realisation,
-            self._rng,
-        )
-
-        # 4. Update water level
-        crop_t = s["active_crop_type"]
-        s["water_level"] += realised
-        if crop_t != CropType.FALLOW:
-            s["water_level"] -= cfg.water_utilised_monthly[crop_t]
-        s["water_level"] = max(0.0, s["water_level"])
-        optimal = cfg.optimal_water_level[crop_t]
-        s["water_level"] = min(s["water_level"], optimal)
-
-        # 5. Age crop & monthly nitrogen impact
-        if crop_t != CropType.FALLOW:
-            s["crop_age_months"] += 1
-            s["soil_nitrogen"] += cfg.monthly_nitrogen_impact[crop_t]
-            s["soil_nitrogen"] = max(0.0, min(1.0, s["soil_nitrogen"]))
-
-        # 6. Natural nitrogen recovery
-        s["soil_nitrogen"] = min(
-            1.0, s["soil_nitrogen"] + cfg.natural_nitrogen_recovery
-        )
-
-        # 7. Age storage & check spoilage
-        if s["stored_amount"] > 0:
-            s["stored_age_months"] += 1
-            remaining, spoiled = apply_spoilage(
-                s["stored_age_months"], s["stored_amount"], cfg.max_storage_age
-            )
-            if spoiled:
+        # 2. Credit revenue to each farm
+        for agent_id, rev in revenues.items():
+            if rev > 0:
+                self._farms[agent_id].s["cash"] += rev
                 messages.append(
-                    f"SPOILAGE: Your stored {cfg.crop_names[s['stored_crop_type']]} "
-                    f"({s['stored_amount']:.1f} tons) has rotted!"
+                    f"Agent {agent_id} received ₹{rev:,.0f} from market clearing."
                 )
-                s["stored_amount"] = 0.0
-                s["stored_crop_type"] = CropType.FALLOW
-                s["stored_age_months"] = 0
-            else:
-                s["stored_amount"] = remaining
 
-        # 8. Accrue interest (using locked rate from loan origination)
-        if s["has_active_loan"] and s["debt"] > 0:
-            monthly_rate = s["loan_interest_rate"] / 12.0
-            s["debt"] *= 1.0 + monthly_rate
+        # 3. Advance physics for every farm (in lockstep)
+        for i, farm in enumerate(self._farms):
+            farm_msgs = farm.advance_month(skip_price_generation=True)
+            for m in farm_msgs:
+                messages.append(f"[Farm {i}] {m}")
 
-        # 9. Monthly fixed cost
-        s["cash"] -= s["inflated_monthly_fixed_cost"]
-
-        # [Future] Storage cost
-        if cfg.enable_storage_cost and s["stored_amount"] > 0:
-            storage_cost = cfg.cost_storage_monthly * s["stored_amount"]
-            s["cash"] -= storage_cost
-
-        # 10. Generate new expected rainfall & market prices
-        s["expected_rainfall"] = generate_rainfall(s["month"], cfg, self._rng)
-        prev_prices = s["prices"]
-        s["prices"] = generate_market_prices(
-            s["month"], cfg, self._rng,
-            prev_prices=prev_prices,
-            effective_base_prices=tuple(s["inflated_base_market_prices"]),
+        # 4. Update shared prices from market engine
+        new_prices = self._market.generate_base_prices(
+            month=self._current_month(),
+            inflated_base_prices=list(
+                self._farms[0].s["inflated_base_market_prices"]
+            ),
         )
+        for farm in self._farms:
+            farm.s["prices"] = tuple(new_prices[1:])
 
-        # 11. Update interest rate
-        optimal_water = (
-            cfg.optimal_water_level[s["active_crop_type"]]
-            if s["active_crop_type"] != CropType.FALLOW
-            else 0.0
-        )
-        s["interest_rate"] = calculate_interest_rate(
-            cfg.base_interest_rate, s["month"],
-            s["expected_rainfall"], optimal_water,
-        )
+        # 5. Reset ledger and forum
+        self._ledger.reset_month()
+        self._forum.reset_month()
 
+        # 6. Advance TimeController
+        self._time_ctrl.advance_month()
+
+        messages.insert(0, "=== Month advanced. ===")
         return messages
-
-    def _apply_inflation(self, s: dict, cfg: EnvConfig) -> None:
-        """Apply compounding inflation to all inflatable values."""
-        factor = 1.0 + cfg.inflation_rate
-        s["inflated_seed_costs"] = [c * factor for c in s["inflated_seed_costs"]]
-        s["inflated_cost_irrigate"] *= factor
-        s["inflated_cost_fertilize"] *= factor
-        s["inflated_loan_chunk"] *= factor
-        s["inflated_base_land_price"] *= factor
-        s["inflated_monthly_fixed_cost"] *= factor
-        s["inflated_base_market_prices"] = [
-            p * factor for p in s["inflated_base_market_prices"]
-        ]
-
-    # ──────────────────────────────────────────────────────────────
-    # Net worth & terminal value
-    # ──────────────────────────────────────────────────────────────
-
-    def _compute_net_worth(self) -> float:
-        """
-        Compute the agent's current net worth.
-
-        net_worth = cash + land_value + stored_value + growing_crop_value − debt
-
-        Used for the Δ(net_worth) reward signal (telescoping sum
-        decomposition that is mathematically equivalent to the sparse
-        final_value − initial_value objective).
-        """
-        s = self._internal
-        cfg = self.config
-
-        land_value = s["inflated_base_land_price"] * s["soil_nitrogen"]
-
-        stored_value = 0.0
-        if s["stored_amount"] > 0 and s["stored_crop_type"] != CropType.FALLOW:
-            stored_value = s["stored_amount"] * s["prices"][s["stored_crop_type"] - 1]
-
-        growing_value = 0.0
-        if s["active_crop_type"] != CropType.FALLOW:
-            est_yield = calculate_yield(
-                s["active_crop_type"],
-                s["crop_age_months"],
-                s["soil_nitrogen"],
-                s["water_level"],
-                s["planting_month"] or s["month"],
-                cfg,
-                rng=None,  # deterministic estimate
-            )
-            growing_value = est_yield * s["prices"][s["active_crop_type"] - 1]
-
-        return s["cash"] + land_value + stored_value + growing_value - s["debt"]
-
-    def _compute_terminal_value(self, s: dict, cfg: EnvConfig) -> float:
-        """
-        Compute the terminal profit: final_value − initial_value.
-
-        final_value  = cash + land_value + stored_value + unharvested_value − debt
-        initial_value = initial_cash + (base_land_price × initial_soil_nitrogen)
-        """
-        final_value = self._compute_net_worth()
-        initial_value = cfg.initial_cash + (cfg.base_land_price * cfg.initial_soil_nitrogen)
-        return final_value - initial_value
 
     # ──────────────────────────────────────────────────────────────
     # Observation builder
     # ──────────────────────────────────────────────────────────────
 
-    def _build_observation(
-        self,
-        yield_potential: float,
-        reward: float,
-        done: bool,
-        message: str,
-    ) -> CroprlObservation:
-        """Construct a CroprlObservation from current internal state."""
-        s = self._internal
-        cfg = self.config
+    def _build_ma_obs(
+        self, agent_id: int, message: str, reward: float, done: bool,
+    ) -> MultiAgentObservation:
+        """Construct a MultiAgentObservation for agent *agent_id*."""
+        farm = self._farms[agent_id]
+        s = farm.s
+        cfg = self._env_cfg
+
+        slot = self._time_ctrl.current_slot_for(agent_id)
+
+        yield_potential = calculate_expected_yield_potential(
+            s["active_crop_type"], s["crop_age_months"],
+            s["soil_nitrogen"], s["water_level"],
+            s["planting_month"] or s["month"], cfg,
+        )
 
         land_price = s["inflated_base_land_price"] * s["soil_nitrogen"]
+        other_crops = self._ledger.planted_crops_this_month(before_slot=slot)
 
-        obs_dict = {
-            "current_month": s["month"],
-            "current_step": s["step"],
-            "expected_rainfall": s["expected_rainfall"],
-            "active_crop_type": s["active_crop_type"],
-            "crop_age_months": s["crop_age_months"],
-            "expected_yield_potential": yield_potential,
-            "soil_nitrogen": s["soil_nitrogen"],
-            "current_water_level": s["water_level"],
-            "cash_balance": s["cash"],
-            "current_debt": s["debt"],
-            "current_interest_rate": s["interest_rate"],
-            "current_land_price": land_price,
-            "market_price_crop_1": s["prices"][0],
-            "market_price_crop_2": s["prices"][1],
-            "market_price_crop_3": s["prices"][2],
-            "cost_seed_1": s["inflated_seed_costs"][1],
-            "cost_seed_2": s["inflated_seed_costs"][2],
-            "cost_seed_3": s["inflated_seed_costs"][3],
-            "cost_irrigate": s["inflated_cost_irrigate"],
-            "cost_fertilize": s["inflated_cost_fertilize"],
-            "stored_crop_type": s["stored_crop_type"],
-            "stored_amount": s["stored_amount"],
-            "stored_age_months": s["stored_age_months"],
-            "message": message,
-        }
-
-        # Text mode
+        # Text summary
         text_summary = ""
         if cfg.text_mode:
-            valid_actions = self._get_valid_actions()
-            # Build a copy with extra display-only fields for the text formatter
-            text_dict = {**obs_dict, "monthly_fixed_cost": s["inflated_monthly_fixed_cost"]}
-            text_summary = format_text_observation(
-                text_dict, cfg, s["has_active_loan"], valid_actions
+            obs_dict_for_text = {
+                "current_month": s["month"],
+                "current_step": s["step"],
+                "expected_rainfall": s["expected_rainfall"],
+                "active_crop_type": s["active_crop_type"],
+                "crop_age_months": s["crop_age_months"],
+                "expected_yield_potential": yield_potential,
+                "soil_nitrogen": s["soil_nitrogen"],
+                "current_water_level": s["water_level"],
+                "cash_balance": s["cash"],
+                "current_debt": s["debt"],
+                "current_interest_rate": s["interest_rate"],
+                "current_land_price": land_price,
+                "market_price_crop_1": s["prices"][0],
+                "market_price_crop_2": s["prices"][1],
+                "market_price_crop_3": s["prices"][2],
+                "cost_seed_1": s["inflated_seed_costs"][1],
+                "cost_seed_2": s["inflated_seed_costs"][2],
+                "cost_seed_3": s["inflated_seed_costs"][3],
+                "cost_irrigate": s["inflated_cost_irrigate"],
+                "cost_fertilize": s["inflated_cost_fertilize"],
+                "stored_crop_type": s["stored_crop_type"],
+                "stored_amount": s["stored_amount"],
+                "stored_age_months": s["stored_age_months"],
+                "message": message,
+                "monthly_fixed_cost": s["inflated_monthly_fixed_cost"],
+            }
+            text_summary = self._format_ma_text(
+                agent_id, obs_dict_for_text, slot, other_crops
             )
 
-        return CroprlObservation(
-            **obs_dict,
+        return MultiAgentObservation(
+            current_month=s["month"],
+            current_step=s["step"],
+            expected_rainfall=s["expected_rainfall"],
+            active_crop_type=s["active_crop_type"],
+            crop_age_months=s["crop_age_months"],
+            expected_yield_potential=yield_potential,
+            soil_nitrogen=s["soil_nitrogen"],
+            current_water_level=s["water_level"],
+            cash_balance=s["cash"],
+            current_debt=s["debt"],
+            current_interest_rate=s["interest_rate"],
+            current_land_price=land_price,
+            market_price_crop_1=s["prices"][0],
+            market_price_crop_2=s["prices"][1],
+            market_price_crop_3=s["prices"][2],
+            market_price_crop_4=s["prices"][3] if len(s["prices"]) > 3 else 0.0,
+            market_price_crop_5=s["prices"][4] if len(s["prices"]) > 4 else 0.0,
+            market_price_crop_6=s["prices"][5] if len(s["prices"]) > 5 else 0.0,
+            cost_seed_1=s["inflated_seed_costs"][1],
+            cost_seed_2=s["inflated_seed_costs"][2],
+            cost_seed_3=s["inflated_seed_costs"][3],
+            cost_seed_4=s["inflated_seed_costs"][4] if len(s["inflated_seed_costs"]) > 4 else 0.0,
+            cost_seed_5=s["inflated_seed_costs"][5] if len(s["inflated_seed_costs"]) > 5 else 0.0,
+            cost_seed_6=s["inflated_seed_costs"][6] if len(s["inflated_seed_costs"]) > 6 else 0.0,
+            cost_irrigate=s["inflated_cost_irrigate"],
+            cost_fertilize=s["inflated_cost_fertilize"],
+            stored_crop_type=s["stored_crop_type"],
+            stored_amount=s["stored_amount"],
+            stored_age_months=s["stored_age_months"],
+            message=message,
             text_summary=text_summary,
             done=done,
             reward=reward,
+            # Multi-agent extensions
+            agent_id=agent_id,
+            month_slot=slot,
+            slots_remaining=self._time_ctrl.slots_remaining(agent_id),
+            forum_posts_remaining=self._forum.posts_remaining(agent_id),
+            other_agents_crops={k: v for k, v in other_crops.items() if k != agent_id},
+            ledger_this_month=self._ledger.events_before_slot(slot),
+            forum_this_month=self._forum.messages_this_month(),
+            last_month_realised_prices=self._last_realised,
+            hype_crop_statuses=self._hype_statuses,
         )
 
-    def _get_valid_actions(self) -> list[int]:
-        """Return the list of currently valid action IDs."""
-        s = self._internal
-        cfg = self.config
-        valid = [ActionType.WAIT]  # Wait is always valid
+    def _format_ma_text(
+        self, agent_id: int, obs_dict: dict, slot: int,
+        other_crops: Dict[int, int],
+    ) -> str:
+        """Append multi-agent sections to the standard text observation."""
+        cfg = self._env_cfg
+        base = format_text_observation(
+            obs_dict, cfg, self._farms[agent_id].has_active_loan
+        )
 
-        # Plant actions (1, 2, 3)
-        if s["active_crop_type"] == CropType.FALLOW:
-            for crop_idx in (CropType.CORN, CropType.WHEAT, CropType.CHICKPEA):
-                if s["cash"] >= s["inflated_seed_costs"][crop_idx]:
-                    valid.append(crop_idx)
+        lines = [base, "", "=== MULTI-AGENT ==="]
+        lines.append(
+            f"Agent: {agent_id} | Slot: {slot}/{self._ma_cfg.action_slots_per_month} "
+            f"| Slots remaining: {self._time_ctrl.slots_remaining(agent_id)}"
+        )
 
-        # Irrigate (4)
-        if (s["active_crop_type"] != CropType.FALLOW
-                and s["cash"] >= s["inflated_cost_irrigate"]):
-            valid.append(ActionType.IRRIGATE)
+        if other_crops:
+            lines.append("")
+            lines.append("NEIGHBOURS (crops planted this month so far):")
+            for aid, ct in other_crops.items():
+                lines.append(f"  Agent {aid}: {cfg.crop_names[ct]}")
 
-        # Fertilize (5)
-        if s["cash"] >= s["inflated_cost_fertilize"]:
-            valid.append(ActionType.FERTILIZE)
+        if self._hype_statuses:
+            lines.append("")
+            lines.append("SOCIAL MEDIA TRENDS (Hype Crops):")
+            for hs in self._hype_statuses:
+                bar = "█" * int(hs.hype_level * 10) + "░" * (10 - int(hs.hype_level * 10))
+                lines.append(
+                    f"  {hs.crop_name}: [{bar}] {hs.hype_level:.0%} ({hs.phase.value})"
+                )
 
-        # Harvest & Store (6), Harvest & Sell (7)
-        if s["active_crop_type"] != CropType.FALLOW and s["crop_age_months"] >= 1:
-            valid.append(ActionType.HARVEST_STORE)
-            valid.append(ActionType.HARVEST_SELL)
+        msgs = self._forum.messages_this_month()
+        if msgs:
+            lines.append("")
+            lines.append("FORUM:")
+            for m in msgs:
+                lines.append(f"  Agent {m.agent_id}: {m.text}")
 
-        # Sell Inventory (8)
-        if s["stored_amount"] > 0:
-            valid.append(ActionType.SELL_INVENTORY)
+        if self._last_realised:
+            lines.append("")
+            lines.append("LAST MONTH CLEARING PRICES:")
+            names = self._env_cfg.crop_names[1:]
+            for name, price in zip(names, self._last_realised):
+                lines.append(f"  {name}: ₹{price:,.0f}/ton")
 
-        # Take Loan (9)
-        if not s["has_active_loan"]:
-            valid.append(ActionType.TAKE_LOAN)
+        return "\n".join(lines)
 
-        # Repay Loan (10)
-        if s["has_active_loan"] and s["cash"] >= s["debt"]:
-            valid.append(ActionType.REPAY_LOAN)
+    # ──────────────────────────────────────────────────────────────
+    # Utilities
+    # ──────────────────────────────────────────────────────────────
 
-        return sorted(valid)
+    def _current_month(self) -> int:
+        return self._farms[0].month if self._farms else 1
+
+    def get_turn_order(self) -> List[int]:
+        """Return the current month's agent turn order, accounting for the rotating offset."""
+        n = self._ma_cfg.num_agents
+        offset = self._time_ctrl._first_agent_offset
+        return [(i + offset) % n for i in range(n)]
+
+    def _check_termination(self, farm: FarmState) -> bool:
+        s = farm.s
+        cfg = self._env_cfg
+        if s["step"] >= cfg.max_steps:
+            return True
+        if s["month_count"] >= cfg.max_months:
+            return True
+        if s["cash"] < 0 and s["has_active_loan"]:
+            return True
+        return False
+
+    @staticmethod
+    def _gini(values: List[float]) -> float:
+        if not values or len(values) < 2:
+            return 0.0
+        arr = sorted(float(max(v, 0)) for v in values)
+        n = len(arr)
+        total = sum(arr)
+        if total <= 0:
+            return 0.0
+        cum = 0.0
+        for i, v in enumerate(arr):
+            cum += (2 * (i + 1) - n - 1) * v
+        return cum / (n * total)

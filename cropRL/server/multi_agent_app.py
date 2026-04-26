@@ -51,7 +51,7 @@ except ImportError as exc:  # pragma: no cover
 
 from cropRL.config import EnvConfig, MultiAgentConfig
 from cropRL.models import MultiAgentAction
-from cropRL.multi_agent_environment import MultiAgentCroprlEnvironment
+from cropRL.server.cropRL_environment import MultiAgentCroprlEnvironment
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
