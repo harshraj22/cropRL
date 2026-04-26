@@ -235,13 +235,13 @@ def train(args):
                         prefix_allowed_tokens_fn=prefix_fn,
                     )
 
-                    action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
-                    
                     # Mask out right-padding in generation
                     full_seqs = outputs
 
                     prompt_len = inputs.input_ids.shape[1]
                     gen_seqs = outputs[:, prompt_len:]
+                    action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
+
                     gen_mask = (gen_seqs != tokenizer.pad_token_id).long() 
                     full_attention_mask = torch.cat([inputs.attention_mask, gen_mask], dim=1)
                     
