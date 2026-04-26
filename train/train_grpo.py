@@ -47,32 +47,32 @@ def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     Given full input_ids, their attention mask, generated sequences, and their mask,
     compute the sum of log probabilities for the non-padded generated tokens.
     """
-    outputs = model(input_ids, attention_mask=attention_mask)
+    outputs = model(input_ids, attention_mask=attention_mask.clone())
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
-    
+
     gen_seq_len = gen_seqs.shape[1]
     gen_logits = logits[:, -gen_seq_len:, :]
     gen_labels = labels[:, -gen_seq_len:]
-    
+
     logprobs = F.log_softmax(gen_logits, dim=-1)
     action_logprobs = logprobs.gather(dim=-1, index=gen_labels.unsqueeze(-1)).squeeze(-1)
-    
+
     # Mask out padding tokens
     masked_logprobs = action_logprobs * gen_mask
     return masked_logprobs.sum(dim=-1)
 
-get_action_logprobs = torch.compile(get_action_logprobs, mode="reduce-overhead")
+get_action_logprobs = torch.compile(get_action_logprobs, mode="default")
 
 def get_action_prefix_fn(tokenizer, prompt_length):
     """Creates a prefix_allowed_tokens_fn to constrain generation to valid action formats."""
     digit_tokens = {str(i): tokenizer.encode(str(i), add_special_tokens=False)[0] for i in range(10)}
     space_token = tokenizer.encode(" ", add_special_tokens=False)[0]
-    
+
     token_1 = digit_tokens["1"]
     tokens_0_to_4 = [digit_tokens[str(i)] for i in range(5)]
     all_digits = list(digit_tokens.values())
-    
+
     def prefix_allowed_tokens_fn(batch_id, input_ids):
         gen_tokens = input_ids[prompt_length:]
         if len(gen_tokens) == 0:
@@ -97,7 +97,7 @@ def get_action_prefix_fn(tokenizer, prompt_length):
                 if first == token_1 and second == token_1:
                     return list(range(tokenizer.vocab_size))
             return [tokenizer.eos_token_id]
-            
+
     return prefix_allowed_tokens_fn
 
 def train(args):
@@ -111,21 +111,21 @@ def train(args):
     print(f"Group Size (G):      {args.group_size}")
     print(f"LoRA Targets:        ['q_proj', 'v_proj']")
     print("="*50)
-    
+
     # Initialize WandB
     wandb.init(project="CropRL-GRPO", name=args.run_name, config=vars(args))
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
+
     # Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         # tokenizer.pad_token = tokenizer.eos_token
         tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
-        
+
     tokenizer.padding_side = "left" # important for batched generation
-    
+
     # Load Model
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -138,7 +138,7 @@ def train(args):
         model.resize_token_embeddings(len(tokenizer))
         with torch.no_grad():
             model.get_input_embeddings().weight[-1].zero_()
-    
+
     # Apply LoRA
     peft_config = LoraConfig(
         r=args.lora_r,
@@ -151,46 +151,46 @@ def train(args):
     model = get_peft_model(model, peft_config)
     print("LoRA applied successfully. Trainable parameters:")
     model.print_trainable_parameters()
-    model.gradient_checkpointing_enable()  
+    model.gradient_checkpointing_enable()
 
     optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.learning_rate)
-    
+
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=args.warmup_iterations,
         num_training_steps=args.num_iterations
     )
-    
+
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     for iteration in tqdm(range(1, args.num_iterations + 1), desc="Training Iterations"):
         print(f"\n--- Iteration {iteration}/{args.num_iterations} ---")
-        
+
         # --- 1. Rollout Phase ---
         model.eval() # Prevent dropout noise during rollout
-        
+
         envs = [create_env_for_task(args.task, text_mode=True) for _ in range(args.group_size)]
         n_agents = envs[0]._ma_cfg.num_agents
-        
+
         # Curriculum Learning: Expanding horizon starts small to learn short-term consequences first
         current_max_months = min(60, 10 + iteration * 2)
         print(f"Curriculum Horizon: {current_max_months} months")
-        
+
         group_seed = iteration
         for env_idx, env in enumerate(envs):
             env._env_cfg.max_months = current_max_months
-            
+
             env.reset(seed=group_seed)
-        
+
         # Get initial net worths for reward shaping (per env, per agent)
         prev_net_worths = [[env._farms[a].compute_net_worth() for a in range(n_agents)] for env in envs]
-        
+
         active_envs = list(range(args.group_size))
         done_agents = {i: set() for i in range(args.group_size)}
         histories = {i: {a: [] for a in range(n_agents)} for i in range(args.group_size)}
         trajectories = [[[] for _ in range(n_agents)] for _ in range(args.group_size)]
-        
+
         step_count = 0
         total_env_steps = envs[0]._env_cfg.max_months * envs[0]._ma_cfg.action_slots_per_month
         with torch.no_grad(), tqdm(total=total_env_steps, desc="Rollout Phase", leave=False) as pbar:
@@ -201,7 +201,7 @@ def train(args):
                     prompts = []
                     valid_env_indices = []
                     agent_ids_for_batch = []
-                    
+
                     # Fetch fresh observations for this agent across active environments
                     for env_idx in active_envs:
                         turn_order = envs[env_idx].get_turn_order()
@@ -212,14 +212,14 @@ def train(args):
                             continue
 
                         obs = envs[env_idx].get_obs(agent_id)
-                        
+
                         if obs.done:
                             done_agents[env_idx].add(agent_id)
                             # Dead/done agents must wait out their slots so they don't block TimeController
                             action_obj = MultiAgentAction(action_id=0, agent_id=agent_id, forum_message=None)
                             envs[env_idx].step(action_obj)
                             continue
-                            
+
                         user_msg = obs.text_summary if getattr(obs, "text_summary", None) else str(obs)
                         history_block = "\n".join(histories[env_idx][agent_id][-12:]) if histories[env_idx][agent_id] else "None"
                         user_msg += f"\n\nRecent History:\n{history_block}"
@@ -238,14 +238,14 @@ def train(args):
                         prompts.append(prompt)
                         valid_env_indices.append(env_idx)
                         agent_ids_for_batch.append(agent_id)
-                    
+
                     if not prompts:
                         continue
-                        
+
                     inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
-                    
+
                     prefix_fn = get_action_prefix_fn(tokenizer, inputs.input_ids.shape[1])
-                    
+
                     outputs = model.generate(
                         **inputs,
                         max_new_tokens=args.max_new_tokens,
@@ -266,28 +266,28 @@ def train(args):
                     gen_seqs = outputs[:, prompt_len:]
                     action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
 
-                    gen_mask = (gen_seqs != tokenizer.pad_token_id).long() 
+                    gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
                     full_attention_mask = torch.cat([inputs.attention_mask, gen_mask], dim=1)
-                    
+
 
                     old_logprobs = get_action_logprobs(model, full_seqs, full_attention_mask, gen_seqs, gen_mask)
-                    
+
                     for idx, env_idx in enumerate(valid_env_indices):
                         agent_id = agent_ids_for_batch[idx]
                         action_text = action_texts[idx]
                         act_id, forum_msg = parse_action(action_text, fallback_action=0)
-                        
+
                         action_obj = MultiAgentAction(action_id=act_id, agent_id=agent_id, forum_message=forum_msg)
                         next_obs = envs[env_idx].step(action_obj)
-                        
+
                         # Reward shaping: Change in exact net worth (including crop/land values)
                         current_net_worth = envs[env_idx]._farms[agent_id].compute_net_worth()
                         reward = current_net_worth - prev_net_worths[env_idx][agent_id]
                         prev_net_worths[env_idx][agent_id] = current_net_worth
-                        
+
                         action_name = envs[env_idx]._env_cfg.action_names[act_id] if act_id < len(envs[env_idx]._env_cfg.action_names) else f"Action {act_id}"
                         histories[env_idx][agent_id].append(f"Step {getattr(next_obs, 'current_step', step_count)}: Selected '{action_name}' -> Reward {reward:+.2f}")
-                        
+
                         trajectories[env_idx][agent_id].append({
                             "input_ids": full_seqs[idx].cpu(),
                             "attention_mask": full_attention_mask[idx].cpu(),
@@ -297,14 +297,14 @@ def train(args):
                             "reward": reward,
                             "action_id": act_id
                         })
-                        
+
                         if next_obs.done:
                             done_agents[env_idx].add(agent_id)
-                            
+
                 # Update active envs list (only keep envs where not all agents are done)
                 active_envs = [i for i in active_envs if len(done_agents[i]) < n_agents]
                 pbar.update(1)
-        
+
         # --- 2. Compute Advantages (GRPO) ---
         # Normalize returns across all agents and all group environments
         all_returns = []
@@ -312,17 +312,17 @@ def train(args):
             for agent_id in range(n_agents):
                 ret = sum(step["reward"] for step in trajectories[env_idx][agent_id])
                 all_returns.append(ret)
-                
+
         all_returns = np.array(all_returns)
         mean_return = all_returns.mean()
         std_return = all_returns.std() + 1e-8
-        
+
         print(f"Returns: {all_returns.round(2)}")
         print(f"Mean Return: {mean_return:.2f} | Std: {std_return:.2f}")
-        
+
         # --- 3. Optimization Phase ---
         model.train() # Enable dropout/training mode
-        
+
         # Flatten dataset for randomized mini-batching
         dataset = []
         ret_idx = 0
@@ -339,16 +339,16 @@ def train(args):
                         "A_i": A_i
                     })
                 ret_idx += 1
-        
+
         # Shuffle dataset to break temporal correlations
         random.shuffle(dataset)
-        
+
         total_loss = 0
         total_kl = 0
         optim_steps = 0
-        
+
         optimizer.zero_grad()
-        
+
         # Iterate over steps, accumulating gradients to simulate mini-batches
         # Iterate over mini-batches
         MINI_BATCH_SIZE = 16  # tune to VRAM
@@ -384,11 +384,11 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
-        
+
         # Logging
         avg_loss = total_loss / max(1, len(dataset))
         avg_kl = total_kl / max(1, len(dataset))
-        
+
         wandb.log({
             "iteration": iteration,
             "mean_return": mean_return,
@@ -402,10 +402,10 @@ def train(args):
             "min_return": all_returns.min(),
             "learning_rate": lr_scheduler.get_last_lr()[0],
         })
-        
+
         # Step the learning rate scheduler at the end of each iteration
         lr_scheduler.step()
-        
+
         # Save Checkpoint
         if iteration % args.save_every == 0:
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{iteration}")
@@ -436,6 +436,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens per action generation")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N iterations")
     parser.add_argument("--output_dir", type=str, default="./train/checkpoints", help="Output directory for checkpoints")
-    
+
     args = parser.parse_args()
     train(args)
