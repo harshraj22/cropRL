@@ -1,5 +1,6 @@
 import json
 import argparse
+import random
 from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
@@ -71,6 +72,30 @@ def filter_by_future_return(records, min_reward, episode_final_returns):
     return kept
 
 
+def filter_student_referenced(records, mu_student, contrast_rate, episode_final_returns):
+    """
+    Keep ALL steps of an episode if its final total_return > mu_student.
+    Also keep a random sample (contrast_rate) of the rejected episodes for diversity.
+    """
+    good_keys = set()
+    bad_keys = set()
+    for key, final_return in episode_final_returns.items():
+        if final_return > mu_student:
+            good_keys.add(key)
+        else:
+            bad_keys.add(key)
+            
+    num_contrast = int(len(bad_keys) * contrast_rate)
+    contrast_keys = set(random.sample(list(bad_keys), num_contrast))
+    accepted_keys = good_keys.union(contrast_keys)
+    
+    kept = [r for r in records if (r.get("metadata", {}).get("episode"), r.get("metadata", {}).get("agent_id")) in accepted_keys]
+    
+    print(f"\n[Student-Referenced] Kept {len(good_keys)} good trajectories (> {mu_student:.1f}).")
+    print(f"[Student-Referenced] Kept {len(contrast_keys)} contrast trajectories from {len(bad_keys)} below threshold.")
+    return kept
+
+
 def print_action_distribution(records, label=""):
     dist = defaultdict(int)
     for record in records:
@@ -124,6 +149,8 @@ def main(args):
         kept = filter_by_episode(records, args.min_reward, episode_final_returns)
     elif args.mode == "future_return":
         kept = filter_by_future_return(records, args.min_reward, episode_final_returns)
+    elif args.mode == "student_referenced":
+        kept = filter_student_referenced(records, args.min_reward, args.contrast_rate, episode_final_returns)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -156,17 +183,24 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         default="episode",
-        choices=["episode", "future_return"],
+        choices=["episode", "future_return", "student_referenced"],
         help=(
             "episode: keep all steps of episodes whose FINAL return >= min_reward. "
-            "future_return: keep step t only if G_t = final_return - total_return[t] >= min_reward."
+            "future_return: keep step t only if G_t = final_return - total_return[t] >= min_reward. "
+            "student_referenced: keep episodes > min_reward (mu_student), plus a random contrast sample of rejected ones."
         ),
     )
     parser.add_argument(
         "--min_reward",
         type=float,
         default=0.0,
-        help="Threshold. Run once without filtering to see P30/P50/P70 stats, then set this."
+        help="Threshold. Run once without filtering to see P30/P50/P70 stats, then set this. Also acts as mu_student for student_referenced mode."
+    )
+    parser.add_argument(
+        "--contrast_rate",
+        type=float,
+        default=0.1,
+        help="Fraction of below-threshold episodes to keep as contrast examples in student_referenced mode (default 0.1)."
     )
     args = parser.parse_args()
     main(args)
