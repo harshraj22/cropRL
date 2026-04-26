@@ -11,7 +11,9 @@ tags:
   - openenv
 ---
 
+
 # CropRL — Multi-Agent Agricultural Decision-Making Environment
+[Hugging Face Blog](https://huggingface.co/spaces/harshraj22/cropRL/blob/main/BLOG.md) | [Colab Training Notebook](https://colab.research.google.com/drive/1IzBgpPT8qJsHAjCRYHSRcJBYXden8tgo?usp=sharing) | [Link To Environment, HF Space](https://huggingface.co/spaces/harshraj22/cropRL)
 
 CropRL simulates the core decision-making challenges of a modern farm ecosystem over a 5-year (60-month) horizon. In this **multi-agent** environment, multiple farmers (agents) operate simultaneously, each managing their own plot of land, finances, and inventory. They choose what to plant, when to harvest, how to manage soil health, and when to take financial risks — all under stochastic weather and fluctuating commodity prices.
 
@@ -236,6 +238,3 @@ You will notice that the LoRA `target_modules` differ between the SFT and GRPO s
 
 ---
 
-## References:
-- [Colab Notebook](https://colab.research.google.com/drive/1IzBgpPT8qJsHAjCRYHSRcJBYXden8tgo?usp=sharing)
-- [Hugging Face Blog](https://huggingface.co/spaces/harshraj22/cropRL/blob/main/BLOG.md)
