@@ -12,6 +12,8 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from peft import LoraConfig, get_peft_model
 
+import bitsandbytes as bnb
+
 import wandb
 
 # Ensure the root directory is on the path so cropRL module works
@@ -20,6 +22,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cropRL.tasks import create_env_for_task
 from cropRL.models import MultiAgentAction
 from cropRL.inference import parse_action, get_agent_system_prompt
+
+def collate_batch(steps, device):
+    # Pad sequences to same length within batch
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [s["input_ids"] for s in steps], batch_first=True
+    ).to(device)
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [s["attention_mask"] for s in steps], batch_first=True
+    ).to(device)
+    gen_seqs = torch.nn.utils.rnn.pad_sequence(
+        [s["gen_seqs"] for s in steps], batch_first=True
+    ).to(device)
+    gen_mask = torch.nn.utils.rnn.pad_sequence(
+        [s["gen_mask"] for s in steps], batch_first=True
+    ).to(device)
+    old_logprobs = torch.tensor([s["old_logprob"] for s in steps], device=device)
+    advantages = torch.tensor([s["A_i"] for s in steps], device=device)
+    return input_ids, attention_mask, gen_seqs, gen_mask, old_logprobs, advantages
+
 
 def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     """
@@ -128,8 +149,11 @@ def train(args):
     model = get_peft_model(model, peft_config)
     print("LoRA applied successfully. Trainable parameters:")
     model.print_trainable_parameters()
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    model.gradient_checkpointing_enable()
+    get_action_logprobs = torch.compile(get_action_logprobs, mode="reduce-overhead")
+  
+
+    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.learning_rate)
     
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
@@ -326,49 +350,41 @@ def train(args):
         optimizer.zero_grad()
         
         # Iterate over steps, accumulating gradients to simulate mini-batches
-        for step_idx, step in tqdm(enumerate(dataset), total=len(dataset), desc="Optimization Phase", leave=False):
-            full_seq = step["input_ids"].unsqueeze(0).to(device)
-            full_attention_mask = step["attention_mask"].unsqueeze(0).to(device)
-            gen_seqs = step["gen_seqs"].unsqueeze(0).to(device)
-            gen_mask = step["gen_mask"].unsqueeze(0).to(device)
-            old_logprob = step["old_logprob"]
-            A_i = step["A_i"]
-            
+        # Iterate over mini-batches
+        MINI_BATCH_SIZE = 16  # tune to VRAM
+        for batch_start in tqdm(range(0, len(dataset), MINI_BATCH_SIZE), desc="Optimization Phase", leave=False):
+            batch = dataset[batch_start:batch_start + MINI_BATCH_SIZE]
+            input_ids, attn_mask, gen_seqs, gen_mask, old_lp, A_i = collate_batch(batch, device)
+
             # Forward pass current model
-            current_logprobs = get_action_logprobs(model, full_seq, full_attention_mask, gen_seqs, gen_mask).squeeze(0)
-            
+            current_logprobs = get_action_logprobs(model, input_ids, attn_mask, gen_seqs, gen_mask)
+
             # Forward pass reference model (LoRA disabled)
             with torch.no_grad():
                 with model.disable_adapter():
-                    ref_logprobs = get_action_logprobs(model, full_seq, full_attention_mask, gen_seqs, gen_mask).squeeze(0)
-            
+                    ref_logprobs = get_action_logprobs(model, input_ids, attn_mask, gen_seqs, gen_mask)
+
             # PPO Ratio
-            ratio = torch.exp(current_logprobs - old_logprob)
-            
+            ratio = torch.exp(current_logprobs - old_lp)
+
             # KL Divergence Penalty
             kl_div = torch.exp(ref_logprobs - current_logprobs) - (ref_logprobs - current_logprobs) - 1
-            
+
             # Clipped Surrogate Objective
             surr1 = ratio * A_i
             surr2 = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * A_i
-            policy_loss = -torch.min(surr1, surr2)
-            
-            loss = policy_loss + args.beta * kl_div
-            
-            # Gradient accumulation
-            loss = loss / args.gradient_accumulation_steps
+            loss = (-torch.min(surr1, surr2) + args.beta * kl_div).mean()
+
             loss.backward()
-            
-            total_loss += loss.item() * args.gradient_accumulation_steps
-            total_kl += kl_div.item()
-            
-            # Step optimizer periodically
-            if (step_idx + 1) % args.gradient_accumulation_steps == 0 or (step_idx + 1) == len(dataset):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                optim_steps += 1
-                
+
+            total_loss += loss.item() * len(batch)
+            total_kl += kl_div.mean().item() * len(batch)
+            optim_steps += 1
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+        
         # Logging
         avg_loss = total_loss / max(1, len(dataset))
         avg_kl = total_kl / max(1, len(dataset))
