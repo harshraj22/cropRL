@@ -62,6 +62,8 @@ def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     masked_logprobs = action_logprobs * gen_mask
     return masked_logprobs.sum(dim=-1)
 
+get_action_logprobs = torch.compile(get_action_logprobs, mode="reduce-overhead")
+
 def get_action_prefix_fn(tokenizer, prompt_length):
     """Creates a prefix_allowed_tokens_fn to constrain generation to valid action formats."""
     digit_tokens = {str(i): tokenizer.encode(str(i), add_special_tokens=False)[0] for i in range(10)}
@@ -149,9 +151,7 @@ def train(args):
     model = get_peft_model(model, peft_config)
     print("LoRA applied successfully. Trainable parameters:")
     model.print_trainable_parameters()
-    model.gradient_checkpointing_enable()
-    get_action_logprobs = torch.compile(get_action_logprobs, mode="reduce-overhead")
-  
+    model.gradient_checkpointing_enable()  
 
     optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.learning_rate)
     
