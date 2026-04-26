@@ -98,7 +98,9 @@ def train(args):
     # Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        # tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+        
     tokenizer.padding_side = "left" # important for batched generation
     
     # Load Model
@@ -108,6 +110,11 @@ def train(args):
         device_map="auto",
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
     )
+
+    if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
+        model.resize_token_embeddings(len(tokenizer))
+        with torch.no_grad():
+            model.get_input_embeddings().weight[-1].zero_()
     
     # Apply LoRA
     peft_config = LoraConfig(
@@ -146,12 +153,11 @@ def train(args):
         current_max_months = min(60, 10 + iteration * 2)
         print(f"Curriculum Horizon: {current_max_months} months")
         
+        group_seed = iteration
         for env_idx, env in enumerate(envs):
             env._env_cfg.max_months = current_max_months
             
-            # Unique seed per iteration and environment to prevent overfitting to a single weather/market trajectory
-            env_seed = (iteration * args.group_size) + env_idx
-            env.reset(seed=env_seed)
+            env.reset(seed=group_seed)
         
         # Get initial net worths for reward shaping (per env, per agent)
         prev_net_worths = [[env._farms[a].compute_net_worth() for a in range(n_agents)] for env in envs]
@@ -228,14 +234,18 @@ def train(args):
                         eos_token_id=tokenizer.eos_token_id,
                         prefix_allowed_tokens_fn=prefix_fn,
                     )
-                    
-                    gen_seqs = outputs[:, inputs.input_ids.shape[1]:]
+
                     action_texts = tokenizer.batch_decode(gen_seqs, skip_special_tokens=True)
                     
                     # Mask out right-padding in generation
-                    gen_mask = (gen_seqs != tokenizer.pad_token_id).long()
                     full_seqs = outputs
-                    full_attention_mask = (full_seqs != tokenizer.pad_token_id).long()
+
+                    prompt_len = inputs.input_ids.shape[1]
+                    gen_seqs = outputs[:, prompt_len:]
+                    gen_mask = (gen_seqs != tokenizer.pad_token_id).long() 
+                    full_attention_mask = torch.cat([inputs.attention_mask, gen_mask], dim=1)
+                    
+
                     old_logprobs = get_action_logprobs(model, full_seqs, full_attention_mask, gen_seqs, gen_mask)
                     
                     for idx, env_idx in enumerate(valid_env_indices):
