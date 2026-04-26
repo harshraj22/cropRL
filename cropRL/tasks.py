@@ -115,7 +115,7 @@ def create_env_for_task(
     -------
     MultiAgentCroprlEnvironment
     """
-    from .multi_agent_environment import MultiAgentCroprlEnvironment
+    from .server.cropRL_environment import MultiAgentCroprlEnvironment
 
     if task_id not in TASKS:
         raise KeyError(
@@ -159,7 +159,7 @@ def create_multi_agent_env_for_task(
     -------
     MultiAgentCroprlEnvironment
     """
-    from .multi_agent_environment import MultiAgentCroprlEnvironment
+    from .server.cropRL_environment import MultiAgentCroprlEnvironment
 
     if task_id not in TASKS:
         raise KeyError(

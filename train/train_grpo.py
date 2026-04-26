@@ -47,9 +47,7 @@ def get_action_logprobs(model, input_ids, attention_mask, gen_seqs, gen_mask):
     Given full input_ids, their attention mask, generated sequences, and their mask,
     compute the sum of log probabilities for the non-padded generated tokens.
     """
-    # outputs = model(input_ids, attention_mask=attention_mask)
     outputs = model(input_ids, attention_mask=attention_mask.clone())
-
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
 

@@ -6,6 +6,6 @@
 
 """Croprl environment server components."""
 
-from .cropRL_environment import CroprlEnvironment
+from .cropRL_environment import MultiAgentCroprlEnvironment
 
-__all__ = ["CroprlEnvironment"]
+__all__ = ["MultiAgentCroprlEnvironment"]

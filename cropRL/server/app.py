@@ -36,18 +36,18 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from cropRL.models import CroprlAction, CroprlObservation
-    from .cropRL_environment import CroprlEnvironment
+    from cropRL.models import MultiAgentAction, MultiAgentObservation
+    from .cropRL_environment import MultiAgentCroprlEnvironment
 except ModuleNotFoundError:
-    from models import CroprlAction, CroprlObservation
-    from server.cropRL_environment import CroprlEnvironment
+    from models import MultiAgentAction, MultiAgentObservation
+    from server.cropRL_environment import MultiAgentCroprlEnvironment
 
 
 # Create the app with web interface and README integration
 app = create_app(
-    CroprlEnvironment,
-    CroprlAction,
-    CroprlObservation,
+    MultiAgentCroprlEnvironment,
+    MultiAgentAction,
+    MultiAgentObservation,
     env_name="cropRL",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )

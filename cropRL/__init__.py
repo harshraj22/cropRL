@@ -31,7 +31,7 @@ from .farm_state import FarmState
 from .market_engine import MarketEngine, HypeEngine
 from .public_ledger import Forum, PublicLedger
 from .time_controller import TimeController, TurnOverError
-from .multi_agent_environment import MultiAgentCroprlEnvironment
+from .server.cropRL_environment import MultiAgentCroprlEnvironment
 from .tasks import (
     TASKS,
     MultiAgentGrader,
